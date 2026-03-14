@@ -1,0 +1,35 @@
+# Compiled CUDA shared libraries
+*.so
+*.o
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Triton cache
+~/.triton/
+
+# Benchmark results
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CUDA profiling outputs
+*.nvprof
+*.nsys-rep
+*.ncu-rep
+*.sqlite
