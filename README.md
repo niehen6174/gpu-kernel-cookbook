@@ -1,6 +1,8 @@
-# GPU Kernel Lab
+# GPU Kernel Cookbook
 
-一个系统化的 **GPU Kernel 学习项目**，实现常见深度学习算子并对比多种 GPU 编程框架。
+A hands-on cookbook for GPU kernel programming: CUDA, Triton, and CuTe DSL implementations of common deep learning operators, with detailed notes and benchmarks.
+
+系统化的 **GPU Kernel 学习项目**，实现常见深度学习算子并对比多种 GPU 编程框架。
 
 ## 项目结构
 
@@ -79,11 +81,23 @@ cd operators/matmul/cuda && bash build.sh
 常见 CUDA 架构：
 | GPU | 架构 | `CUDA_ARCH` |
 |-----|------|-------------|
-| V100 | Volta | `sm_70` |
+| RTX 5090 | Blackwell | `sm_100` |
+| H200 | Hopper | `sm_90` |
+| H20 | Hopper | `sm_90` |
+| L20 | Ada Lovelace | `sm_89` |
 | A100 | Ampere | `sm_80` |
 | RTX 30xx | Ampere | `sm_86` |
-| H100 | Hopper | `sm_90` |
-| RTX 40xx | Ada Lovelace | `sm_89` |
+
+## Benchmark 环境
+
+以下 GPU 上均有实测数据：
+
+| GPU | 架构 | 显存 | 峰值 FP32 | 显存带宽 |
+|-----|------|------|-----------|---------|
+| RTX 5090 | Blackwell (sm_100) | 32 GB | ~109 TFLOPS | ~1.79 TB/s |
+| H200 SXM | Hopper (sm_90) | 141 GB | ~67 TFLOPS | ~4.8 TB/s |
+| H20 | Hopper (sm_90) | 96 GB | ~44 TFLOPS | ~4.0 TB/s |
+| L20 | Ada Lovelace (sm_89) | 48 GB | ~59.8 TFLOPS | ~864 GB/s |
 
 ### 运行测试
 
@@ -144,8 +158,3 @@ CUDA (手写) → Triton (Python DSL) → CuTe DSL → CUTLASS
 - [CUTLASS 文档](https://github.com/NVIDIA/cutlass)
 - [FlashAttention 论文](https://arxiv.org/abs/2205.14135)
 - [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/)
-
-## 相关项目
-
-- [`../LeetGPU`](../LeetGPU)：参考实现（vector add、matmul、transpose、softmax、attention）
-- [`../cutlass`](../cutlass)：CUTLASS 库源码
