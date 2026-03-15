@@ -12,50 +12,123 @@ import os
 import argparse
 import json
 import datetime
+import ctypes
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../"))
 
 import torch
 from common.utils import benchmark_func, compute_bandwidth, compute_tflops, get_gpu_info
 
+ROOT = os.path.join(os.path.dirname(__file__), "../")
 
+
+# -------------------------------------------------------------------------
+# 辅助：加载各算子的 CUDA .so
+# -------------------------------------------------------------------------
+def _load_so(rel_path, fn_specs):
+    """加载 .so 并配置函数签名。fn_specs: {fn_name: (argtypes, restype)}"""
+    path = os.path.join(ROOT, rel_path)
+    if not os.path.exists(path):
+        return None
+    lib = ctypes.CDLL(path)
+    for fn_name, (argtypes, restype) in fn_specs.items():
+        f = getattr(lib, fn_name)
+        f.argtypes = argtypes
+        f.restype = restype
+    return lib
+
+
+# -------------------------------------------------------------------------
+# vector_add
+# -------------------------------------------------------------------------
 def benchmark_vector_add():
     from operators.vector_add.pytorch.baseline import vector_add_pytorch
     from operators.vector_add.triton.kernel import vector_add_triton
+
+    _ptr3_int = ([ctypes.c_void_p] * 3 + [ctypes.c_int], None)
+    cuda_lib = _load_so("operators/vector_add/cuda/vector_add.so", {
+        "vector_add_cuda_v1": _ptr3_int,
+        "vector_add_cuda_v2": _ptr3_int,
+    })
+    cutlass_lib = _load_so("operators/vector_add/cutlass/vector_add_cutlass.so", {
+        "vector_add_cutlass_v1": _ptr3_int,
+        "vector_add_cutlass_v2": _ptr3_int,
+    })
+
+    def run_cuda(lib, fn, A, B):
+        C = torch.empty_like(A)
+        getattr(lib, fn)(A.data_ptr(), B.data_ptr(), C.data_ptr(), ctypes.c_int(A.numel()))
+        return C
 
     results = {}
     for N in [1024*1024, 1024*1024*16, 1024*1024*64]:
         A = torch.randn(N, device="cuda")
         B = torch.randn(N, device="cuda")
         bytes_accessed = N * 3 * 4
-
         key = f"N={N//1024//1024}M"
         results[key] = {}
 
-        for name, fn in [("pytorch", lambda: vector_add_pytorch(A, B)),
-                          ("triton",  lambda: vector_add_triton(A, B))]:
+        impls = [
+            ("pytorch",        lambda: vector_add_pytorch(A, B)),
+            ("triton",         lambda: vector_add_triton(A, B)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1",    lambda: run_cuda(cuda_lib, "vector_add_cuda_v1", A, B)),
+                ("cuda_v2_f4", lambda: run_cuda(cuda_lib, "vector_add_cuda_v2", A, B)),
+            ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1",    lambda: run_cuda(cutlass_lib, "vector_add_cutlass_v1", A, B)),
+                ("cute_v2",    lambda: run_cuda(cutlass_lib, "vector_add_cutlass_v2", A, B)),
+            ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
                 "bw_gbs": compute_bandwidth(bytes_accessed, r["mean_ms"]),
             }
-
     return results
 
 
+# -------------------------------------------------------------------------
+# transpose
+# -------------------------------------------------------------------------
 def benchmark_transpose():
     from operators.transpose.pytorch.baseline import transpose_pytorch
     from operators.transpose.triton.kernel import transpose_triton
+
+    _ptr2_int2 = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int], None)
+    cuda_lib = _load_so("operators/transpose/cuda/transpose.so", {
+        "transpose_cuda_v1": _ptr2_int2,
+        "transpose_cuda_v2": _ptr2_int2,
+    })
+
+    def run_cuda(lib, fn, A):
+        M, N = A.shape
+        B = torch.empty(N, M, dtype=A.dtype, device=A.device)
+        getattr(lib, fn)(A.data_ptr(), B.data_ptr(), ctypes.c_int(M), ctypes.c_int(N))
+        return B
 
     results = {}
     for M, N in [(1024, 1024), (4096, 4096), (8192, 8192)]:
         A = torch.randn(M, N, device="cuda")
         bytes_accessed = M * N * 4 * 2
-
         key = f"{M}x{N}"
         results[key] = {}
-        for name, fn in [("pytorch", lambda: transpose_pytorch(A)),
-                          ("triton",  lambda: transpose_triton(A))]:
+
+        impls = [
+            ("pytorch", lambda: transpose_pytorch(A)),
+            ("triton",  lambda: transpose_triton(A)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "transpose_cuda_v1", A)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "transpose_cuda_v2", A)),
+            ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
@@ -64,19 +137,45 @@ def benchmark_transpose():
     return results
 
 
+# -------------------------------------------------------------------------
+# softmax
+# -------------------------------------------------------------------------
 def benchmark_softmax():
     from operators.softmax.pytorch.baseline import softmax_pytorch
     from operators.softmax.triton.kernel import softmax_triton
+
+    _ptr2_int2 = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int], None)
+    cuda_lib = _load_so("operators/softmax/cuda/softmax.so", {
+        "softmax_cuda_v1": _ptr2_int2,
+        "softmax_cuda_v2": _ptr2_int2,
+        "softmax_cuda_v3": _ptr2_int2,
+    })
+
+    def run_cuda(lib, fn, X):
+        B, N = X.shape
+        Y = torch.empty_like(X)
+        getattr(lib, fn)(X.data_ptr(), Y.data_ptr(), ctypes.c_int(B), ctypes.c_int(N))
+        return Y
 
     results = {}
     for B, N in [(1024, 512), (4096, 2048), (4096, 8192)]:
         X = torch.randn(B, N, device="cuda")
         bytes_accessed = B * N * 3 * 4
-
         key = f"B={B},N={N}"
         results[key] = {}
-        for name, fn in [("pytorch", lambda: softmax_pytorch(X)),
-                          ("triton",  lambda: softmax_triton(X))]:
+
+        impls = [
+            ("pytorch", lambda: softmax_pytorch(X)),
+            ("triton",  lambda: softmax_triton(X)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "softmax_cuda_v1", X)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "softmax_cuda_v2", X)),
+                ("cuda_v3", lambda: run_cuda(cuda_lib, "softmax_cuda_v3", X)),
+            ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
@@ -85,9 +184,30 @@ def benchmark_softmax():
     return results
 
 
+# -------------------------------------------------------------------------
+# layernorm
+# -------------------------------------------------------------------------
 def benchmark_layernorm():
     from operators.layernorm.pytorch.baseline import layernorm_pytorch
     from operators.layernorm.triton.kernel import layernorm_triton
+
+    _ln_args = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                 ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float], None)
+    cuda_lib = _load_so("operators/layernorm/cuda/layernorm.so", {
+        "layernorm_cuda_v1": _ln_args,
+        "layernorm_cuda_v2": _ln_args,
+    })
+
+    def run_cuda(lib, fn, X, W, b):
+        B, N = X.shape
+        Y = torch.empty_like(X)
+        w_ptr = W.data_ptr() if W is not None else 0
+        b_ptr = b.data_ptr() if b is not None else 0
+        getattr(lib, fn)(
+            X.data_ptr(), ctypes.c_void_p(w_ptr), ctypes.c_void_p(b_ptr),
+            Y.data_ptr(), ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-5)
+        )
+        return Y
 
     results = {}
     for B, N in [(4096, 512), (4096, 1024), (4096, 4096)]:
@@ -95,11 +215,20 @@ def benchmark_layernorm():
         W = torch.ones(N, device="cuda")
         b = torch.zeros(N, device="cuda")
         bytes_accessed = B * N * 4 * 4
-
         key = f"B={B},N={N}"
         results[key] = {}
-        for name, fn in [("pytorch", lambda: layernorm_pytorch(X, W, b)),
-                          ("triton",  lambda: layernorm_triton(X, W, b))]:
+
+        impls = [
+            ("pytorch", lambda: layernorm_pytorch(X, W, b)),
+            ("triton",  lambda: layernorm_triton(X, W, b)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "layernorm_cuda_v1", X, W, b)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "layernorm_cuda_v2", X, W, b)),
+            ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
@@ -108,20 +237,51 @@ def benchmark_layernorm():
     return results
 
 
+# -------------------------------------------------------------------------
+# matmul
+# -------------------------------------------------------------------------
 def benchmark_matmul():
     from operators.matmul.pytorch.baseline import matmul_pytorch
     from operators.matmul.triton.kernel import matmul_triton
+
+    _mm_args = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                 ctypes.c_int, ctypes.c_int, ctypes.c_int], None)
+    cuda_lib = _load_so("operators/matmul/cuda/matmul.so", {
+        "matmul_cuda_v1": _mm_args,
+        "matmul_cuda_v2": _mm_args,
+        "matmul_cuda_v3": _mm_args,
+    })
+
+    def run_cuda(lib, fn, A, B):
+        M, K = A.shape
+        _, N = B.shape
+        C = torch.empty(M, N, dtype=A.dtype, device=A.device)
+        getattr(lib, fn)(
+            A.data_ptr(), B.data_ptr(), C.data_ptr(),
+            ctypes.c_int(M), ctypes.c_int(K), ctypes.c_int(N)
+        )
+        return C
 
     results = {}
     for M, K, N in [(512, 512, 512), (2048, 2048, 2048), (4096, 4096, 4096)]:
         A = torch.randn(M, K, device="cuda")
         B = torch.randn(K, N, device="cuda")
         flops = 2 * M * N * K
-
         key = f"{M}x{K}x{N}"
         results[key] = {}
-        for name, fn in [("pytorch (cuBLAS)", lambda: matmul_pytorch(A, B)),
-                          ("triton",           lambda: matmul_triton(A, B))]:
+
+        impls = [
+            ("pytorch (cuBLAS)", lambda: matmul_pytorch(A, B)),
+            ("triton",           lambda: matmul_triton(A, B)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "matmul_cuda_v1", A, B)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "matmul_cuda_v2", A, B)),
+                ("cuda_v3", lambda: run_cuda(cuda_lib, "matmul_cuda_v3", A, B)),
+            ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
@@ -130,6 +290,9 @@ def benchmark_matmul():
     return results
 
 
+# -------------------------------------------------------------------------
+# attention
+# -------------------------------------------------------------------------
 def benchmark_attention():
     from operators.attention.pytorch.baseline import attention_pytorch
     from operators.attention.triton.kernel import flash_attention_triton
@@ -140,11 +303,15 @@ def benchmark_attention():
         K = torch.randn(B, H, N, D, device="cuda")
         V = torch.randn(B, H, N, D, device="cuda")
         flops = 4 * B * H * N * N * D
-
         key = f"B={B},H={H},N={N},D={D}"
         results[key] = {}
-        for name, fn in [("pytorch (naive)",  lambda: attention_pytorch(Q, K, V)),
-                          ("triton flash",     lambda: flash_attention_triton(Q, K, V))]:
+
+        impls = [
+            ("pytorch (naive)", lambda: attention_pytorch(Q, K, V)),
+            ("triton flash",    lambda: flash_attention_triton(Q, K, V)),
+        ]
+
+        for name, fn in impls:
             r = benchmark_func(fn)
             results[key][name] = {
                 "mean_ms": r["mean_ms"],
@@ -153,6 +320,9 @@ def benchmark_attention():
     return results
 
 
+# -------------------------------------------------------------------------
+# 打印 & 主入口
+# -------------------------------------------------------------------------
 BENCHMARKS = {
     "vector_add": benchmark_vector_add,
     "transpose":  benchmark_transpose,
@@ -180,7 +350,7 @@ def print_results(op_name, results):
                 extra = f"  BW={metrics['bw_gbs']:.1f} GB/s"
             elif "tflops" in metrics:
                 extra = f"  {metrics['tflops']:.2f} TFLOPS"
-            print(f"    {impl:<20} {ms:.4f} ms  speedup={speedup:.2f}x{extra}")
+            print(f"    {impl:<22} {ms:.4f} ms  speedup={speedup:.2f}x{extra}")
 
 
 def main():
