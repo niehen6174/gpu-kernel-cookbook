@@ -88,13 +88,23 @@ def test_correctness(N=1024 * 1024):
         out_v2 = run_cuda_v2(lib, A, B)
         check_correctness(out_v2, ref, name="CUDA v2 (float4)")
 
-    # CuTe（可选）
+    # CuTe DSL (Python)
     try:
         from operators.vector_add.cute.kernel import run_vector_add_cute
         out_cute = run_vector_add_cute(A, B)
-        check_correctness(out_cute, ref, name="CuTe DSL")
+        check_correctness(out_cute, ref, name="CuTe DSL (Python)")
     except ImportError:
-        print("[SKIP] CuTe DSL (cutlass not installed)")
+        print("[SKIP] CuTe DSL (cutlass Python package not installed)")
+
+    # CuTe C++ (CUTLASS header-only)
+    try:
+        from operators.vector_add.cutlass.wrapper import vector_add_cutlass_v1, vector_add_cutlass_v2
+        out_cutlass_v1 = vector_add_cutlass_v1(A, B)
+        check_correctness(out_cutlass_v1, ref, name="CuTe C++ v1 (Tensor/local_tile)")
+        out_cutlass_v2 = vector_add_cutlass_v2(A, B)
+        check_correctness(out_cutlass_v2, ref, name="CuTe C++ v2 (uint128_t vectorized)")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe C++: {e}")
 
     print()
 
@@ -144,6 +154,31 @@ def run_benchmark(N=1024 * 1024 * 16):
         bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
         speedup = results["PyTorch"]["mean_ms"] / res["mean_ms"]
         print(f"CUDA v2 f4  : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  speedup={speedup:.2f}x")
+
+    # CuTe DSL (Python)
+    try:
+        from operators.vector_add.cute.kernel import run_vector_add_cute
+        res = benchmark_func(run_vector_add_cute, A, B)
+        bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+        speedup = results["PyTorch"]["mean_ms"] / res["mean_ms"]
+        print(f"CuTe DSL    : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  speedup={speedup:.2f}x")
+    except ImportError:
+        print("[SKIP] CuTe DSL (cutlass Python package not installed)")
+
+    # CuTe C++ (CUTLASS header-only)
+    try:
+        from operators.vector_add.cutlass.wrapper import vector_add_cutlass_v1, vector_add_cutlass_v2
+        res = benchmark_func(vector_add_cutlass_v1, A, B)
+        bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+        speedup = results["PyTorch"]["mean_ms"] / res["mean_ms"]
+        print(f"CuTe C++ v1 : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  speedup={speedup:.2f}x")
+
+        res = benchmark_func(vector_add_cutlass_v2, A, B)
+        bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+        speedup = results["PyTorch"]["mean_ms"] / res["mean_ms"]
+        print(f"CuTe C++ v2 : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  speedup={speedup:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe C++: {e}")
 
     print()
 
