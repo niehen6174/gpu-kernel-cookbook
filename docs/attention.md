@@ -239,7 +239,49 @@ def flash_attn_fwd_kernel(..., BLOCK_M, BLOCK_N, BLOCK_D, CAUSAL):
 
 ---
 
-## 9. 性能分析
+## 9. 测试方法
+
+### 9.1 运行正确性测试 + Benchmark
+
+Attention 的 CUDA kernel 目前为模板头文件，主要通过 Python 调用 Triton 实现运行：
+
+```bash
+# 从项目根目录运行
+cd gpu-kernel-lab
+python -m operators.attention.test
+```
+
+---
+
+## 10. Benchmark 结果（H20，B=4 H=8 N=1024 D=64，float32）
+
+H20 理论峰值 FP32：~44 TFLOPS
+
+| 实现 | 延迟 | TFLOPS | vs PyTorch naive |
+|------|------|--------|-----------------|
+| PyTorch (naive) | 0.6303 ms | 13.63 T | 1.00x |
+| PyTorch SDPA | 0.7481 ms | 11.48 T | 0.84x |
+| Triton Flash Attention | 0.2960 ms | 29.02 T | 2.13x |
+
+**不同序列长度的 Scaling（B=1 H=8 D=64）：**
+
+| N | PyTorch naive | Triton Flash | 加速比 |
+|---|---------------|--------------|--------|
+| 256 | 0.074 ms (1.82T) | 0.050 ms (2.69T) | 1.48x |
+| 512 | 0.084 ms (6.41T) | 0.064 ms (8.35T) | 1.30x |
+| 1024 | 0.198 ms (10.87T) | 0.105 ms (20.48T) | 1.88x |
+| 2048 | 0.645 ms (13.32T) | 0.302 ms (28.45T) | 2.14x |
+| 4096 | 2.602 ms (13.21T) | 1.089 ms (31.54T) | 2.39x |
+
+注：
+- Flash Attention 在所有序列长度下均优于 naive 实现
+- 加速比随 N 增大而提升（N=4096 时达到 2.39x），因为 naive 的 O(N²) HBM 访问随 N 放大
+- PyTorch SDPA 在此配置下比 naive 慢（0.84x），可能是小 batch 下 kernel launch 开销占比高
+- Triton Flash Attention 在 N=4096 时达到 31.54 TFLOPS，约为 H20 峰值的 72%
+
+---
+
+## 11. 性能分析
 
 **计算密度分析：**
 ```
@@ -270,7 +312,7 @@ Arithmetic Intensity = 137 GFLOP / 1.34 GB ≈ 102 FLOP/byte
 
 ---
 
-## 10. 关键学习点
+## 12. 关键学习点
 
 1. **Memory vs Compute Bound**：根据 Arithmetic Intensity 判断瓶颈
 2. **IO-Aware 算法**：从全局内存访问次数角度设计算法
@@ -281,7 +323,7 @@ Arithmetic Intensity = 137 GFLOP / 1.34 GB ≈ 102 FLOP/byte
 
 ---
 
-## 11. 扩展阅读
+## 13. 扩展阅读
 
 - [FlashAttention 论文](https://arxiv.org/abs/2205.14135)
 - [FlashAttention-2 论文](https://arxiv.org/abs/2307.08691)

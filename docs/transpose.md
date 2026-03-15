@@ -193,35 +193,56 @@ __global__ void transpose_v2_shared(const float* input, float* output, int rows,
 
 ---
 
-## 7. 性能对比
+## 7. 测试方法
 
-以下为参考数据（A100，4096×4096 float32）：
+### 7.1 编译 CUDA Kernel
 
-| 实现 | 延迟 | 带宽 | 理论峰值利用率 |
-|------|------|------|----------------|
-| Naive | ~4.2 ms | ~63 GB/s | 3% |
-| Shared Memory | ~0.6 ms | ~440 GB/s | 22% |
-| PyTorch (cuBLAS) | ~0.4 ms | ~660 GB/s | 33% |
-| 理论峰值 | — | ~2000 GB/s | 100% |
+```bash
+cd gpu-kernel-lab/operators/transpose/cuda && bash build.sh
+# 或指定架构
+CUDA_ARCH=sm_90 bash build.sh
+```
 
-注：转置的 Arithmetic Intensity = 0.125 FLOP/byte（极低），
-性能瓶颈完全在内存带宽。即使是最优实现也只能达到峰值带宽的 ~40%，
-原因是转置操作无法像 copy 那样完全利用两个方向的带宽。
+### 7.2 运行正确性测试 + Benchmark
+
+```bash
+# 从项目根目录运行
+cd gpu-kernel-lab
+python -m operators.transpose.test
+```
 
 ---
 
-## 8. Roofline 分析
+## 8. Benchmark 结果（H20，4096×4096，float32）
+
+H20 理论峰值带宽：~4.0 TB/s
+
+| 实现 | 延迟 | 带宽 | vs PyTorch |
+|------|------|------|------------|
+| PyTorch | 0.1418 ms | 946 GB/s | 1.00x |
+| Triton | 0.0756 ms | 1776 GB/s | 1.88x |
+| CUDA v1 (naive) | 0.2913 ms | 461 GB/s | 0.49x |
+| CUDA v2 (shared mem) | 0.0683 ms | 1965 GB/s | 2.08x |
+
+注：
+- CUDA v2 通过 shared memory tiling + bank conflict padding，带宽比 naive 提升 4.3×
+- Triton 的 transpose kernel 同样使用了类似的优化策略，性能接近 CUDA v2
+- PyTorch 使用 cuBLAS，内部有额外的内存管理开销，反而比手写 CUDA v2 慢
+
+---
+
+## 9. 性能对比（vs A100 理论）
 
 ```
-操作量：M×N 个 float 读 + M×N 个 float 写 = 2MN × 4 bytes
-FLOPs：0（仅内存操作）
-Arithmetic Intensity：0 FLOP/byte（memory-bound 极端情况）
+操作量：4096² × 2 × 4 bytes ≈ 134 MB
+H20 峰值带宽：~4000 GB/s
+理论最优延迟 = 134 MB / 4000 GB/s = 0.034 ms
 
-A100 峰值带宽：~2000 GB/s
-理论最优延迟（4096²×2×4 bytes）：
-  = 134 MB / 2000 GB/s = 0.067 ms
-实际最优：~0.4 ms（受 cache 效率和内存控制器限制）
+CUDA v2 实测：0.068 ms，带宽效率 = 1965 / 4000 ≈ 49%
+Triton：0.076 ms，带宽效率 = 1776 / 4000 ≈ 44%
 ```
+
+转置永远无法达到 100% 带宽利用率，因为写方向无法与硬件缓存行对齐。
 
 ---
 

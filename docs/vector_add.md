@@ -160,24 +160,55 @@ CuTe 的核心抽象：
 
 ---
 
-## 8. Benchmark 结果参考
+## 8. 测试方法
 
-以下为 A100 80GB 上的参考数据（N = 16M，float32）：
+### 8.1 编译 CUDA Kernel
 
-| 实现 | 延迟 | 带宽 | 利用率 |
-|------|------|------|--------|
-| PyTorch | 0.34 ms | 565 GB/s | 28% |
-| Triton | 0.33 ms | 582 GB/s | 29% |
-| CUDA v1 | 0.35 ms | 548 GB/s | 27% |
-| CUDA v2 (float4) | 0.31 ms | 618 GB/s | 31% |
+```bash
+# 在项目根目录下
+cd gpu-kernel-lab
 
-注：A100 理论峰值带宽约 2000 GB/s，利用率偏低是因为：
-1. 计算本身太简单，无法完全掩盖内存延迟
-2. 存在 kernel 启动开销
+# 编译 vector_add 的 CUDA kernel（sm_90 = H20/H200）
+cd operators/vector_add/cuda && bash build.sh
+# 或指定架构
+CUDA_ARCH=sm_90 bash build.sh
+```
+
+### 8.2 运行正确性测试 + Benchmark
+
+```bash
+# 从项目根目录运行（确保 common/ 模块可以被导入）
+cd gpu-kernel-lab
+python -m operators.vector_add.test
+```
+
+### 8.3 单独运行 Benchmark
+
+```bash
+python benchmarks/benchmark.py --op vector_add
+```
 
 ---
 
-## 9. 关键学习点
+## 9. Benchmark 结果（H20，N = 16M，float32）
+
+H20 理论峰值带宽：~4.0 TB/s（Hopper 架构，sm_90）
+
+| 实现 | 延迟 | 带宽 | vs PyTorch |
+|------|------|------|------------|
+| PyTorch | 0.0637 ms | 3158 GB/s | 1.00x |
+| Triton | 0.0746 ms | 2698 GB/s | 0.85x |
+| CUDA v1 (naive) | 0.1108 ms | 1818 GB/s | 0.58x |
+| CUDA v2 (float4) | 0.0729 ms | 2762 GB/s | 0.87x |
+
+注：
+- H20 理论峰值带宽约 4000 GB/s，实际利用率约 70-80%（已相当高效）
+- PyTorch/Triton/CUDA v2 性能接近，差异来自编译器优化和 kernel launch 开销
+- CUDA v1 naive 的带宽利用率偏低，主要因为 float4 指令减少了指令开销
+
+---
+
+## 10. 关键学习点
 
 1. **CUDA 线程层次**：Grid → Block → Warp → Thread
 2. **全局线程 ID 计算**：`blockIdx.x * blockDim.x + threadIdx.x`
@@ -188,7 +219,7 @@ CuTe 的核心抽象：
 
 ---
 
-## 10. 进一步学习
+## 11. 进一步学习
 
 - [CUDA 内存模型](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#memory-hierarchy)
 - [Coalesced Memory Access](https://developer.nvidia.com/blog/how-access-global-memory-efficiently-cuda-c-kernels/)

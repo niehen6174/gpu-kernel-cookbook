@@ -287,21 +287,47 @@ Tensor Core (A100):
 
 ---
 
-## 9. 性能参考（A100 80GB，M=N=K=4096）
+## 9. 测试方法
 
-| 实现 | 延迟 | TFLOPS | 峰值利用率 |
-|------|------|--------|----------|
-| Naive CUDA | ~180 ms | 0.76 T | 4% |
-| Shared Memory Tiling | ~1.8 ms | 76 T | 19% |
-| Thread Coarsening | ~1.2 ms | 114 T | 29% |
-| Triton（autotuned）| ~0.45 ms | 305 T | 78% |
-| PyTorch (cuBLAS) | ~0.42 ms | 327 T | 84% |
+### 9.1 编译 CUDA Kernel
 
-注：以上数据使用 FP32，使用 FP16/BF16 + Tensor Core 可以再快 10-16×。
+```bash
+cd gpu-kernel-lab/operators/matmul/cuda && bash build.sh
+# 或指定架构
+CUDA_ARCH=sm_90 bash build.sh
+```
+
+### 9.2 运行正确性测试 + Benchmark
+
+```bash
+# 从项目根目录运行
+cd gpu-kernel-lab
+python -m operators.matmul.test
+```
 
 ---
 
-## 10. 关键学习点
+## 10. Benchmark 结果（H20，M=N=K=4096，float32）
+
+H20 理论峰值 FP32：~44 TFLOPS
+
+| 实现 | 延迟 | TFLOPS | vs PyTorch |
+|------|------|--------|------------|
+| PyTorch (cuBLAS) | 4.55 ms | 30.2 T | 1.00x |
+| Triton (autotuned) | 2.90 ms | 47.4 T | 1.57x |
+| CUDA v1 (naive) | 39.2 ms | 3.5 T | 0.12x |
+| CUDA v2 (tiling 32×32) | 25.8 ms | 5.3 T | 0.18x |
+| CUDA v3 (thread coarsening) | 13.1 ms | 10.5 T | 0.35x |
+
+注：
+- Triton autotuned 版本超过 PyTorch cuBLAS（1.57x），因为 Triton 在 H20 上使用了 Tensor Core + 最优 tile size
+- CUDA v1 naive 约为 cuBLAS 的 12%，大量时间浪费在重复内存读取
+- v2 tiling 提升到 18%，带宽需求降低 TILE(32)×，但仍未充分利用 Tensor Core
+- v3 thread coarsening 进一步提升到 35%，寄存器复用率更高
+
+---
+
+## 11. 关键学习点
 
 1. **Compute-bound vs Memory-bound**：Arithmetic Intensity 分析
 2. **Shared Memory Tiling**：核心优化，TILE 倍的带宽节省

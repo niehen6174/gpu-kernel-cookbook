@@ -220,33 +220,49 @@ def softmax_kernel(input_ptr, output_ptr, B, N, stride_b, stride_n, BLOCK_SIZE: 
 
 ---
 
-## 7. 性能分析
+## 7. 测试方法
 
-| 指标 | 值 |
-|------|-----|
-| 读操作 | 2 × B × N float（naive 3 pass）|
-| 写操作 | B × N float |
-| FLOPs | ~5N（max, exp, sum, div） |
-| Arithmetic Intensity | ~5N / (3N × 4B) ≈ 0.42 FLOP/byte |
+### 7.1 编译 CUDA Kernel
 
-Softmax 是 **memory-bound** 操作，优化目标是减少内存访问次数。
+```bash
+cd gpu-kernel-lab/operators/softmax/cuda && bash build.sh
+# 或指定架构
+CUDA_ARCH=sm_90 bash build.sh
+```
 
-**Online softmax 的优势：**
-- 将 3 pass 减少到 2 pass（1 pass 读 + 1 pass 写）
-- 内存访问减少 ~33%
+### 7.2 运行正确性测试 + Benchmark
 
-参考性能（A100，B=4096，N=2048）：
-
-| 实现 | 延迟 | 带宽 |
-|------|------|------|
-| PyTorch（cuDNN）| ~0.15 ms | ~850 GB/s |
-| Triton | ~0.18 ms | ~710 GB/s |
-| CUDA v1（3-pass）| ~0.25 ms | ~510 GB/s |
-| CUDA v3（online）| ~0.16 ms | ~800 GB/s |
+```bash
+# 从项目根目录运行
+cd gpu-kernel-lab
+python -m operators.softmax.test
+```
 
 ---
 
-## 8. Flash Attention 的连接
+## 8. Benchmark 结果（H20，B=4096 行，N=2048 列，float32）
+
+H20 理论峰值带宽：~4.0 TB/s
+
+| 实现 | 延迟 | 带宽 | vs PyTorch |
+|------|------|------|------------|
+| PyTorch (cuDNN) | 0.0379 ms | 2655 GB/s | 1.00x |
+| Triton | 0.0395 ms | 2551 GB/s | 0.96x |
+| CUDA v1 (3-pass, shared mem) | 0.1364 ms | 738 GB/s | 0.28x |
+| CUDA v2 (online softmax) | 0.0725 ms | 1388 GB/s | 0.52x |
+| CUDA v3 (two-level warp) | 0.0720 ms | 1398 GB/s | 0.53x |
+
+注：
+- Triton 性能与 PyTorch cuDNN 持平（0.96x），说明高质量 Triton 实现可以媲美 vendor 库
+- CUDA v1 三趟扫描带宽最低，是因为全局内存读取次数多（3× 输入 + 2× 中间 exp）
+- CUDA v2/v3 通过 Online Softmax 减少为 2 趟，带宽提升约 2×
+- v2 与 v3 性能接近，两级规约主要在更大 N 时才体现出优势
+
+---
+
+---
+
+## 10. Flash Attention 的连接
 
 Softmax 中的 online softmax 算法是 Flash Attention 的核心：
 
@@ -264,7 +280,7 @@ O = running sum of softmax_weights @ V
 
 ---
 
-## 9. 关键学习点
+## 11. 关键学习点
 
 1. **Reduction 算法**：tree reduction 和 warp shuffle reduction
 2. **数值稳定性**：减去 max 避免 exp 溢出
