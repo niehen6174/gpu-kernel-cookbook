@@ -162,17 +162,23 @@ CuTe 的核心抽象：
 
 ## 8. 测试方法
 
-### 8.1 编译 CUDA Kernel
+### 8.1 编译 CUDA / CuTe Kernel
 
 ```bash
 # 在项目根目录下
 cd gpu-kernel-lab
 
-# 编译 vector_add 的 CUDA kernel（sm_90 = H20/H200）
-cd operators/vector_add/cuda && bash build.sh
-# 或指定架构
-CUDA_ARCH=sm_90 bash build.sh
+# 编译 CUDA kernel（sm_90 = H20/H200）
+CUDA_ARCH=sm_90 bash operators/vector_add/cuda/build.sh
+
+# 编译 CuTe C++ kernel（会自动检测 CUTLASS 路径）
+CUDA_ARCH=sm_90 bash operators/vector_add/cutlass/build.sh
 ```
+
+`find_cutlass.sh` 会自动按以下顺序检索 CUTLASS：
+1. 环境变量 `CUTLASS_PATH`（手动指定）
+2. flashinfer 包内置 CUTLASS（当前机器推荐，无需额外安装）
+3. 系统路径 `/usr/local/cutlass`、`~/cutlass`
 
 ### 8.2 运行正确性测试 + Benchmark
 
@@ -194,17 +200,40 @@ python benchmarks/benchmark.py --op vector_add
 
 H20 理论峰值带宽：~4.0 TB/s（Hopper 架构，sm_90）
 
-| 实现 | 延迟 | 带宽 | vs PyTorch |
-|------|------|------|------------|
-| PyTorch | 0.0637 ms | 3158 GB/s | 1.00x |
-| Triton | 0.0746 ms | 2698 GB/s | 0.85x |
-| CUDA v1 (naive) | 0.1108 ms | 1818 GB/s | 0.58x |
-| CUDA v2 (float4) | 0.0729 ms | 2762 GB/s | 0.87x |
+| 实现 | 延迟 | 带宽 | vs PyTorch | 说明 |
+|------|------|------|------------|------|
+| PyTorch | 0.0631 ms | 3191 GB/s | 1.00x | cuBLAS/cuDNN 内部优化 |
+| Triton | 0.0739 ms | 2723 GB/s | 0.85x | auto-vectorized |
+| CUDA v1 (naive) | 0.1107 ms | 1819 GB/s | 0.57x | 每次 32-bit load |
+| CUDA v2 (float4) | 0.0733 ms | 2747 GB/s | 0.86x | 128-bit load，手写 |
+| CuTe C++ v1 (local_tile) | 0.1147 ms | 1756 GB/s | 0.55x | 每次 32-bit，CuTe 抽象 |
+| CuTe C++ v2 (uint128_t) | 0.0729 ms | 2761 GB/s | 0.87x | 128-bit Copy Atom |
 
-注：
-- H20 理论峰值带宽约 4000 GB/s，实际利用率约 70-80%（已相当高效）
-- PyTorch/Triton/CUDA v2 性能接近，差异来自编译器优化和 kernel launch 开销
-- CUDA v1 naive 的带宽利用率偏低，主要因为 float4 指令减少了指令开销
+### 结果分析
+
+**CuTe C++ v1 vs CUDA v1（朴素对比）：**
+- 带宽相近（1756 vs 1819 GB/s），CuTe v1 略低约 3%
+- 原因：`local_tile` / `local_partition` 增加了少量指针计算开销
+- **结论：CuTe 的 Layout 抽象对性能几乎没有额外代价**，差异在测量误差范围内
+
+**CuTe C++ v2 vs CUDA v2（向量化对比）：**
+- 带宽几乎相同（2761 vs 2747 GB/s），性能完全等价
+- CuTe v2 用 `uint128_t` Copy Atom，CUDA v2 用 `float4` reinterpret_cast
+- **结论：CuTe Copy Atom 与手写 float4 性能等价**，但语义更清晰，更易扩展到 async copy 等高级指令
+
+**为什么 PyTorch 最快？**
+- PyTorch 使用 cuBLAS/Thrust，内部有 persistent kernel、stream 复用等优化
+- 对于 vector_add 这类极简算子，PyTorch 的 kernel launch 开销更低
+
+**各实现带宽效率（vs 4000 GB/s 峰值）：**
+```
+PyTorch:        3191 / 4000 = 80%  ← 最高效
+CuTe C++ v2:    2761 / 4000 = 69%  ← 与 CUDA v2/Triton 持平
+CUDA v2 float4: 2747 / 4000 = 69%
+Triton:         2723 / 4000 = 68%
+CUDA v1 naive:  1819 / 4000 = 45%
+CuTe C++ v1:    1756 / 4000 = 44%
+```
 
 ---
 
