@@ -60,6 +60,13 @@ def test_correctness():
             for v in ["matmul_cuda_v1", "matmul_cuda_v2", "matmul_cuda_v3"]:
                 out = run_cuda(lib, v, A, B)
                 check_correctness(out, ref, name=f"CUDA {v.split('_')[-1]}", atol=1e-3, rtol=1e-3)
+
+        try:
+            from operators.matmul.cutlass.wrapper import matmul_cutlass_v1, matmul_cutlass_v2
+            check_correctness(matmul_cutlass_v1(A, B), ref, name=f"CuTe v1 ({M}x{K}x{N})", atol=1e-3)
+            check_correctness(matmul_cutlass_v2(A, B), ref, name=f"CuTe v2 ({M}x{K}x{N})", atol=1e-3)
+        except RuntimeError as e:
+            print(f"  [SKIP] CuTe: {e}")
     print()
 
 
@@ -89,6 +96,15 @@ def run_benchmark(M=4096, K=4096, N=4096):
             res = benchmark_func(run_cuda, lib, v, A, B)
             tflops = compute_tflops(flops, res["mean_ms"])
             print(f"CUDA {v.split('_')[-1]:4s}        : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+
+    try:
+        from operators.matmul.cutlass.wrapper import matmul_cutlass_v1, matmul_cutlass_v2
+        for label, fn in [("CuTe v1", matmul_cutlass_v1), ("CuTe v2", matmul_cutlass_v2)]:
+            res = benchmark_func(fn, A, B)
+            tflops = compute_tflops(flops, res["mean_ms"])
+            print(f"{label:10s}      : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe: {e}")
     print()
 
 

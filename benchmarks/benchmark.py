@@ -105,6 +105,11 @@ def benchmark_transpose():
         "transpose_cuda_v2": _ptr2_int2,
     })
 
+    cutlass_lib = _load_so("operators/transpose/cutlass/transpose_cutlass.so", {
+        "transpose_cutlass_v1": _ptr2_int2,
+        "transpose_cutlass_v2": _ptr2_int2,
+    })
+
     def run_cuda(lib, fn, A):
         M, N = A.shape
         B = torch.empty(N, M, dtype=A.dtype, device=A.device)
@@ -126,6 +131,11 @@ def benchmark_transpose():
             impls += [
                 ("cuda_v1", lambda: run_cuda(cuda_lib, "transpose_cuda_v1", A)),
                 ("cuda_v2", lambda: run_cuda(cuda_lib, "transpose_cuda_v2", A)),
+            ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "transpose_cutlass_v1", A)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "transpose_cutlass_v2", A)),
             ]
 
         for name, fn in impls:
@@ -151,6 +161,11 @@ def benchmark_softmax():
         "softmax_cuda_v3": _ptr2_int2,
     })
 
+    cutlass_lib = _load_so("operators/softmax/cutlass/softmax_cutlass.so", {
+        "softmax_cutlass_v1": _ptr2_int2,
+        "softmax_cutlass_v2": _ptr2_int2,
+    })
+
     def run_cuda(lib, fn, X):
         B, N = X.shape
         Y = torch.empty_like(X)
@@ -174,6 +189,11 @@ def benchmark_softmax():
                 ("cuda_v2", lambda: run_cuda(cuda_lib, "softmax_cuda_v2", X)),
                 ("cuda_v3", lambda: run_cuda(cuda_lib, "softmax_cuda_v3", X)),
             ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "softmax_cutlass_v1", X)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "softmax_cutlass_v2", X)),
+            ]
 
         for name, fn in impls:
             r = benchmark_func(fn)
@@ -196,6 +216,11 @@ def benchmark_layernorm():
     cuda_lib = _load_so("operators/layernorm/cuda/layernorm.so", {
         "layernorm_cuda_v1": _ln_args,
         "layernorm_cuda_v2": _ln_args,
+    })
+
+    cutlass_lib = _load_so("operators/layernorm/cutlass/layernorm_cutlass.so", {
+        "layernorm_cutlass_v1": _ln_args,
+        "layernorm_cutlass_v2": _ln_args,
     })
 
     def run_cuda(lib, fn, X, W, b):
@@ -227,6 +252,11 @@ def benchmark_layernorm():
                 ("cuda_v1", lambda: run_cuda(cuda_lib, "layernorm_cuda_v1", X, W, b)),
                 ("cuda_v2", lambda: run_cuda(cuda_lib, "layernorm_cuda_v2", X, W, b)),
             ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "layernorm_cutlass_v1", X, W, b)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "layernorm_cutlass_v2", X, W, b)),
+            ]
 
         for name, fn in impls:
             r = benchmark_func(fn)
@@ -250,6 +280,11 @@ def benchmark_matmul():
         "matmul_cuda_v1": _mm_args,
         "matmul_cuda_v2": _mm_args,
         "matmul_cuda_v3": _mm_args,
+    })
+
+    cutlass_lib = _load_so("operators/matmul/cutlass/matmul_cutlass.so", {
+        "matmul_cutlass_v1": _mm_args,
+        "matmul_cutlass_v2": _mm_args,
     })
 
     def run_cuda(lib, fn, A, B):
@@ -279,6 +314,11 @@ def benchmark_matmul():
                 ("cuda_v1", lambda: run_cuda(cuda_lib, "matmul_cuda_v1", A, B)),
                 ("cuda_v2", lambda: run_cuda(cuda_lib, "matmul_cuda_v2", A, B)),
                 ("cuda_v3", lambda: run_cuda(cuda_lib, "matmul_cuda_v3", A, B)),
+            ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "matmul_cutlass_v1", A, B)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "matmul_cutlass_v2", A, B)),
             ]
 
         for name, fn in impls:

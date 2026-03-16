@@ -54,6 +54,13 @@ def test_correctness():
             for v in ["softmax_cuda_v1", "softmax_cuda_v2", "softmax_cuda_v3"]:
                 out = run_cuda(lib, v, X)
                 check_correctness(out, ref, name=f"CUDA {v.split('_')[-1]} ({B}x{N})")
+
+        try:
+            from operators.softmax.cutlass.wrapper import softmax_cutlass_v1, softmax_cutlass_v2
+            check_correctness(softmax_cutlass_v1(X), ref, name=f"CuTe v1 ({B}x{N})")
+            check_correctness(softmax_cutlass_v2(X), ref, name=f"CuTe v2 ({B}x{N})")
+        except RuntimeError as e:
+            print(f"  [SKIP] CuTe: {e}")
     print()
 
 
@@ -83,6 +90,15 @@ def run_benchmark(B=4096, N=2048):
             res = benchmark_func(run_cuda, lib, v, X)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"CUDA {v.split('_')[-1]:4s}   : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+
+    try:
+        from operators.softmax.cutlass.wrapper import softmax_cutlass_v1, softmax_cutlass_v2
+        for label, fn in [("CuTe v1", softmax_cutlass_v1), ("CuTe v2", softmax_cutlass_v2)]:
+            res = benchmark_func(fn, X)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe: {e}")
     print()
 
 

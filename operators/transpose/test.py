@@ -55,6 +55,13 @@ def test_correctness():
             check_correctness(out, ref, name=f"CUDA v1 ({M}x{N})")
             out = run_cuda(lib, "transpose_cuda_v2", A)
             check_correctness(out, ref, name=f"CUDA v2 ({M}x{N})")
+
+        try:
+            from operators.transpose.cutlass.wrapper import transpose_cutlass_v1, transpose_cutlass_v2
+            check_correctness(transpose_cutlass_v1(A), ref, name=f"CuTe v1 ({M}x{N})")
+            check_correctness(transpose_cutlass_v2(A), ref, name=f"CuTe v2 ({M}x{N})")
+        except RuntimeError as e:
+            print(f"  [SKIP] CuTe: {e}")
     print()
 
 
@@ -84,6 +91,15 @@ def run_benchmark(M=4096, N=4096):
             res = benchmark_func(run_cuda, lib, f"transpose_cuda_{v}", A)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"CUDA {v}    : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+
+    try:
+        from operators.transpose.cutlass.wrapper import transpose_cutlass_v1, transpose_cutlass_v2
+        for label, fn in [("CuTe v1", transpose_cutlass_v1), ("CuTe v2", transpose_cutlass_v2)]:
+            res = benchmark_func(fn, A)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe: {e}")
     print()
 
 
