@@ -337,6 +337,13 @@ def benchmark_attention():
     from operators.attention.pytorch.baseline import attention_pytorch
     from operators.attention.triton.kernel import flash_attention_triton
 
+    cutlass_lib_available = False
+    try:
+        from operators.attention.cutlass.wrapper import flash_attention_cutlass_v1, flash_attention_cutlass_v2
+        cutlass_lib_available = True
+    except RuntimeError:
+        pass
+
     results = {}
     for B, H, N, D in [(4, 8, 512, 64), (4, 8, 1024, 64), (1, 8, 4096, 64)]:
         Q = torch.randn(B, H, N, D, device="cuda")
@@ -350,6 +357,11 @@ def benchmark_attention():
             ("pytorch (naive)", lambda: attention_pytorch(Q, K, V)),
             ("triton flash",    lambda: flash_attention_triton(Q, K, V)),
         ]
+        if cutlass_lib_available:
+            impls += [
+                ("cute_v1", lambda: flash_attention_cutlass_v1(Q, K, V)),
+                ("cute_v2", lambda: flash_attention_cutlass_v2(Q, K, V)),
+            ]
 
         for name, fn in impls:
             r = benchmark_func(fn)

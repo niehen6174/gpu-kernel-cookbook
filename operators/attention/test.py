@@ -39,6 +39,14 @@ def test_correctness():
         except Exception as e:
             print(f"  [SKIP] PyTorch SDPA: {e}")
 
+        # CuTe Flash Attention
+        try:
+            from operators.attention.cutlass.wrapper import flash_attention_cutlass_v1, flash_attention_cutlass_v2
+            check_correctness(flash_attention_cutlass_v1(Q, K, V), ref, name=f"CuTe v1 ({N}x{D})", atol=5e-3)
+            check_correctness(flash_attention_cutlass_v2(Q, K, V), ref, name=f"CuTe v2 ({N}x{D})", atol=5e-3)
+        except RuntimeError as e:
+            print(f"  [SKIP] CuTe: {e}")
+
     # Causal attention test
     print("\n  Causal attention test:")
     Q = torch.randn(2, 4, 256, 64, device="cuda")
@@ -47,6 +55,13 @@ def test_correctness():
     ref_causal = attention_pytorch(Q, K, V, causal=True)
     out_causal = flash_attention_triton(Q, K, V, causal=True)
     check_correctness(out_causal, ref_causal, name="Triton Flash Attn Causal", atol=5e-3)
+
+    try:
+        from operators.attention.cutlass.wrapper import flash_attention_cutlass_v2
+        check_correctness(flash_attention_cutlass_v2(Q, K, V, causal=True), ref_causal,
+                          name="CuTe v2 Causal", atol=5e-3)
+    except RuntimeError as e:
+        print(f"  [SKIP] CuTe: {e}")
     print()
 
 
@@ -79,6 +94,16 @@ def run_benchmark(B=4, H=8, N=1024, D=64):
     res = benchmark_func(flash_attention_triton, Q, K, V)
     tflops = compute_tflops(flops, res["mean_ms"])
     print(f"Triton Flash    : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+
+    try:
+        from operators.attention.cutlass.wrapper import flash_attention_cutlass_v1, flash_attention_cutlass_v2
+        for label, fn in [("CuTe v1", flash_attention_cutlass_v1),
+                          ("CuTe v2", flash_attention_cutlass_v2)]:
+            res = benchmark_func(fn, Q, K, V)
+            tflops = compute_tflops(flops, res["mean_ms"])
+            print(f"{label:<16}: {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CuTe: {e}")
 
     print()
 
