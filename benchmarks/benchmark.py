@@ -286,6 +286,10 @@ def benchmark_matmul():
         "matmul_cutlass_v1": _mm_args,
         "matmul_cutlass_v2": _mm_args,
     })
+    cutlass_hl_lib = _load_so("operators/matmul/cutlass/matmul_cutlass_hl.so", {
+        "matmul_cutlass_hl_v1": _mm_args,
+        "matmul_cutlass_hl_v2": _mm_args,
+    })
 
     def run_cuda(lib, fn, A, B):
         M, K = A.shape
@@ -319,6 +323,11 @@ def benchmark_matmul():
             impls += [
                 ("cute_v1", lambda: run_cuda(cutlass_lib, "matmul_cutlass_v1", A, B)),
                 ("cute_v2", lambda: run_cuda(cutlass_lib, "matmul_cutlass_v2", A, B)),
+            ]
+        if cutlass_hl_lib:
+            impls += [
+                ("cutlass_hl_v1", lambda: run_cuda(cutlass_hl_lib, "matmul_cutlass_hl_v1", A, B)),
+                ("cutlass_hl_v2", lambda: run_cuda(cutlass_hl_lib, "matmul_cutlass_hl_v2", A, B)),
             ]
 
         for name, fn in impls:
