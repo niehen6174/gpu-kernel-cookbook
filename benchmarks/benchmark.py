@@ -373,6 +373,134 @@ def benchmark_attention():
 
 
 # -------------------------------------------------------------------------
+# rms_norm
+# -------------------------------------------------------------------------
+def benchmark_rms_norm():
+    from operators.rms_norm.pytorch.baseline import rms_norm_pytorch
+    from operators.rms_norm.triton.kernel import rms_norm_triton
+
+    _rn_args = ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                 ctypes.c_int, ctypes.c_int, ctypes.c_float], None)
+    cuda_lib = _load_so("operators/rms_norm/cuda/rms_norm.so", {
+        "rms_norm_cuda_v1": _rn_args,
+        "rms_norm_cuda_v2": _rn_args,
+    })
+    cutlass_lib = _load_so("operators/rms_norm/cutlass/rms_norm_cutlass.so", {
+        "rms_norm_cutlass_v1": _rn_args,
+        "rms_norm_cutlass_v2": _rn_args,
+    })
+
+    def run_cuda(lib, fn, x, w):
+        B, N = x.shape
+        y = torch.empty_like(x)
+        getattr(lib, fn)(
+            x.data_ptr(), w.data_ptr(), y.data_ptr(),
+            ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-6)
+        )
+        return y
+
+    results = {}
+    for B, N in [(1024, 512), (4096, 4096), (4096, 8192)]:
+        x = torch.randn(B, N, device="cuda")
+        w = torch.randn(N, device="cuda")
+        # 2 reads (x, w) + 1 write (y) = 3 * B * N * 4 bytes
+        bytes_accessed = B * N * 3 * 4
+        key = f"B={B},N={N}"
+        results[key] = {}
+
+        impls = [
+            ("pytorch",    lambda: rms_norm_pytorch(x, w, 1e-6)),
+            ("triton",     lambda: rms_norm_triton(x, w, 1e-6)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "rms_norm_cuda_v1", x, w)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "rms_norm_cuda_v2", x, w)),
+            ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "rms_norm_cutlass_v1", x, w)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "rms_norm_cutlass_v2", x, w)),
+            ]
+
+        for name, fn in impls:
+            r = benchmark_func(fn)
+            results[key][name] = {
+                "mean_ms": r["mean_ms"],
+                "bw_gbs": compute_bandwidth(bytes_accessed, r["mean_ms"]),
+            }
+    return results
+
+
+# -------------------------------------------------------------------------
+# rope
+# -------------------------------------------------------------------------
+def benchmark_rope():
+    from operators.rope.pytorch.baseline import build_cos_sin_cache, apply_rope_pytorch
+    from operators.rope.triton.kernel import rope_triton
+
+    _rope_args = ([ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p,
+                   ctypes.c_int, ctypes.c_int, ctypes.c_int], None)
+    cuda_lib = _load_so("operators/rope/cuda/rope.so", {
+        "rope_cuda_v1": _rope_args,
+        "rope_cuda_v2": _rope_args,
+    })
+    cutlass_lib = _load_so("operators/rope/cutlass/rope_cutlass.so", {
+        "rope_cutlass_v1": _rope_args,
+        "rope_cutlass_v2": _rope_args,
+    })
+
+    def run_cuda(lib, fn, q, k, cos_cache, sin_cache, positions):
+        q_out = q.clone()
+        k_out = k.clone()
+        seq_len, num_heads, head_dim = q.shape
+        pos32 = positions.to(torch.int32).contiguous()
+        getattr(lib, fn)(
+            q_out.data_ptr(), k_out.data_ptr(),
+            cos_cache.data_ptr(), sin_cache.data_ptr(),
+            pos32.data_ptr(),
+            ctypes.c_int(seq_len), ctypes.c_int(num_heads), ctypes.c_int(head_dim)
+        )
+        return q_out, k_out
+
+    results = {}
+    for seq_len, num_heads, head_dim in [(512, 8, 64), (2048, 32, 64), (4096, 32, 64)]:
+        cos_cache, sin_cache = build_cos_sin_cache(seq_len + 64, head_dim, device="cuda")
+        q = torch.randn(seq_len, num_heads, head_dim, device="cuda")
+        k = torch.randn(seq_len, num_heads, head_dim, device="cuda")
+        positions = torch.arange(seq_len, device="cuda")
+        # Q + K: 2 reads + 2 writes = 4 * seq_len * num_heads * head_dim * 4 bytes
+        bytes_accessed = 4 * seq_len * num_heads * head_dim * 4
+        key = f"seq={seq_len},h={num_heads},d={head_dim}"
+        results[key] = {}
+
+        impls = [
+            ("pytorch",    lambda: apply_rope_pytorch(q, k, cos_cache, sin_cache, positions)),
+            ("triton_v1",  lambda: rope_triton(q, k, cos_cache, sin_cache, positions)),
+        ]
+        if cuda_lib:
+            impls += [
+                ("cuda_v1", lambda: run_cuda(cuda_lib, "rope_cuda_v1", q, k, cos_cache, sin_cache, positions)),
+                ("cuda_v2", lambda: run_cuda(cuda_lib, "rope_cuda_v2", q, k, cos_cache, sin_cache, positions)),
+            ]
+        if cutlass_lib:
+            impls += [
+                ("cute_v1", lambda: run_cuda(cutlass_lib, "rope_cutlass_v1", q, k, cos_cache, sin_cache, positions)),
+                ("cute_v2", lambda: run_cuda(cutlass_lib, "rope_cutlass_v2", q, k, cos_cache, sin_cache, positions)),
+            ]
+
+        for name, fn in impls:
+            r = benchmark_func(fn)
+            results[key][name] = {
+                "mean_ms": r["mean_ms"],
+                "bw_gbs": compute_bandwidth(bytes_accessed, r["mean_ms"]),
+            }
+    return results
+
+
+# -------------------------------------------------------------------------
 # 打印 & 主入口
 # -------------------------------------------------------------------------
 BENCHMARKS = {
@@ -382,6 +510,8 @@ BENCHMARKS = {
     "layernorm":  benchmark_layernorm,
     "matmul":     benchmark_matmul,
     "attention":  benchmark_attention,
+    "rms_norm":   benchmark_rms_norm,
+    "rope":       benchmark_rope,
 }
 
 
