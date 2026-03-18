@@ -52,7 +52,7 @@ gpu-kernel-lab/
 | Matmul | ⭐⭐⭐⭐ | Shared Memory Tiling，Roofline | [matmul.md](docs/matmul.md) |
 | Attention | ⭐⭐⭐⭐⭐ | Flash Attention，IO-Aware | [attention.md](docs/attention.md) |
 | RMSNorm | ⭐⭐⭐ | float4 向量化，Fused Add+Norm | [rms_norm.md](docs/rms_norm.md) |
-| RoPE | ⭐⭐⭐ | Rotary Position Embedding | — |
+| RoPE | ⭐⭐⭐ | Rotary Position Embedding | [rope.md](docs/rope.md) |
 
 ## 每个算子的实现
 
