@@ -33,3 +33,4 @@ Thumbs.db
 *.nsys-rep
 *.ncu-rep
 *.sqlite
+results/ncu/
