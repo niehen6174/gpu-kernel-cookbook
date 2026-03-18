@@ -15,7 +15,8 @@ gpu-kernel-lab/
 │   ├── softmax.md           # Reduction、online softmax、warp shuffle
 │   ├── layernorm.md         # Welford 算法、两级规约
 │   ├── matmul.md            # Shared memory tiling、Roofline 分析
-│   └── attention.md         # Flash Attention、IO-Aware 算法
+│   ├── attention.md         # Flash Attention、IO-Aware 算法
+│   └── rms_norm.md          # RMS 归一化、float4 向量化、Fused Add+Norm
 │
 ├── common/
 │   ├── utils.py             # benchmark 工具、性能指标计算
@@ -31,7 +32,9 @@ gpu-kernel-lab/
 │   ├── softmax/             # ⭐⭐⭐ Reduction
 │   ├── layernorm/           # ⭐⭐⭐ Warp Reduction
 │   ├── matmul/              # ⭐⭐⭐⭐ Shared Memory Tiling
-│   └── attention/           # ⭐⭐⭐⭐⭐ Fused Kernel (Flash Attention)
+│   ├── attention/           # ⭐⭐⭐⭐⭐ Fused Kernel (Flash Attention)
+│   ├── rms_norm/            # ⭐⭐⭐ float4 向量化、Fused Add+Norm
+│   └── rope/                # ⭐⭐⭐ Rotary Position Embedding
 │
 └── scripts/
     ├── build_all.sh
@@ -48,6 +51,8 @@ gpu-kernel-lab/
 | LayerNorm | ⭐⭐⭐ | Welford 算法，Warp Reduction | [layernorm.md](docs/layernorm.md) |
 | Matmul | ⭐⭐⭐⭐ | Shared Memory Tiling，Roofline | [matmul.md](docs/matmul.md) |
 | Attention | ⭐⭐⭐⭐⭐ | Flash Attention，IO-Aware | [attention.md](docs/attention.md) |
+| RMSNorm | ⭐⭐⭐ | float4 向量化，Fused Add+Norm | [rms_norm.md](docs/rms_norm.md) |
+| RoPE | ⭐⭐⭐ | Rotary Position Embedding | — |
 
 ## 每个算子的实现
 
