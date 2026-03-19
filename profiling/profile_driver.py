@@ -85,6 +85,7 @@ def _kernels_rms_norm():
     cuda_lib = _load_so("operators/rms_norm/cuda/rms_norm.so", {
         "rms_norm_cuda_v1": (_args, None),
         "rms_norm_cuda_v2": (_args, None),
+        "rms_norm_cuda_v3": (_args, None),
     })
     cute_lib = _load_so("operators/rms_norm/cutlass/rms_norm_cutlass.so", {
         "rms_norm_cutlass_v1": (_args, None),
@@ -101,6 +102,7 @@ def _kernels_rms_norm():
     if cuda_lib:
         kernels["cuda_v1"] = _call(cuda_lib, "rms_norm_cuda_v1")
         kernels["cuda_v2"] = _call(cuda_lib, "rms_norm_cuda_v2")
+        kernels["cuda_v3"] = _call(cuda_lib, "rms_norm_cuda_v3")
     if cute_lib:
         kernels["cute_v1"] = _call(cute_lib, "rms_norm_cutlass_v1")
         kernels["cute_v2"] = _call(cute_lib, "rms_norm_cutlass_v2")

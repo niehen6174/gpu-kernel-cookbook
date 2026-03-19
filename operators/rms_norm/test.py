@@ -31,7 +31,7 @@ def load_cuda_lib():
                 ctypes.c_int, ctypes.c_int, ctypes.c_float]
     _fused_args = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                    ctypes.c_int, ctypes.c_int, ctypes.c_float]
-    for fn in ["rms_norm_cuda_v1", "rms_norm_cuda_v2"]:
+    for fn in ["rms_norm_cuda_v1", "rms_norm_cuda_v2", "rms_norm_cuda_v3"]:
         getattr(lib, fn).argtypes = _rn_args
         getattr(lib, fn).restype = None
     lib.fused_add_rms_norm_cuda.argtypes = _fused_args
@@ -89,7 +89,7 @@ def test_correctness():
         # CUDA
         lib = load_cuda_lib()
         if lib:
-            for v in ["rms_norm_cuda_v1", "rms_norm_cuda_v2"]:
+            for v in ["rms_norm_cuda_v1", "rms_norm_cuda_v2", "rms_norm_cuda_v3"]:
                 out = run_cuda_rms_norm(lib, v, x, w, eps)
                 check_correctness(out, ref, name=f"CUDA {v.split('_')[-1]} ({B}x{N})", atol=1e-5)
 
@@ -153,7 +153,7 @@ def run_benchmark(B=4096, N=4096):
 
     lib = load_cuda_lib()
     if lib:
-        for v in ["rms_norm_cuda_v1", "rms_norm_cuda_v2"]:
+        for v in ["rms_norm_cuda_v1", "rms_norm_cuda_v2", "rms_norm_cuda_v3"]:
             res = benchmark_func(run_cuda_rms_norm, lib, v, x, w, eps)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"CUDA {v.split('_')[-1]:4s}  : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
