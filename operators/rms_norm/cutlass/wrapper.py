@@ -7,7 +7,7 @@ def _load():
     lib = ctypes.CDLL(p)
     _args = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
              ctypes.c_int, ctypes.c_int, ctypes.c_float]
-    for fn in ["rms_norm_cutlass_v1", "rms_norm_cutlass_v2"]:
+    for fn in ["rms_norm_cutlass_v1", "rms_norm_cutlass_v2", "rms_norm_cutlass_v3"]:
         f = getattr(lib, fn)
         f.argtypes = _args
         f.restype = None
@@ -43,3 +43,7 @@ def rms_norm_cutlass_v1(x, weight, eps=1e-6):
 def rms_norm_cutlass_v2(x, weight, eps=1e-6):
     """CuTe v2: float4 向量化 + CuTe Tensor"""
     return _call("rms_norm_cutlass_v2", x, weight, eps)
+
+def rms_norm_cutlass_v3(x, weight, eps=1e-6):
+    """CuTe v3: LDG.128 + 寄存器缓存 x/w（借鉴 sglang norm_fusion）"""
+    return _call("rms_norm_cutlass_v3", x, weight, eps)

@@ -95,9 +95,10 @@ def test_correctness():
 
         # CuTe
         try:
-            from operators.rms_norm.cutlass.wrapper import rms_norm_cutlass_v1, rms_norm_cutlass_v2
+            from operators.rms_norm.cutlass.wrapper import rms_norm_cutlass_v1, rms_norm_cutlass_v2, rms_norm_cutlass_v3
             check_correctness(rms_norm_cutlass_v1(x, w, eps), ref, name=f"CuTe v1 ({B}x{N})", atol=1e-5)
             check_correctness(rms_norm_cutlass_v2(x, w, eps), ref, name=f"CuTe v2 ({B}x{N})", atol=1e-5)
+            check_correctness(rms_norm_cutlass_v3(x, w, eps), ref, name=f"CuTe v3 ({B}x{N})", atol=1e-5)
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
 
@@ -159,8 +160,8 @@ def run_benchmark(B=4096, N=4096):
             print(f"CUDA {v.split('_')[-1]:4s}  : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
 
     try:
-        from operators.rms_norm.cutlass.wrapper import rms_norm_cutlass_v1, rms_norm_cutlass_v2
-        for label, fn in [("CuTe v1", rms_norm_cutlass_v1), ("CuTe v2", rms_norm_cutlass_v2)]:
+        from operators.rms_norm.cutlass.wrapper import rms_norm_cutlass_v1, rms_norm_cutlass_v2, rms_norm_cutlass_v3
+        for label, fn in [("CuTe v1", rms_norm_cutlass_v1), ("CuTe v2", rms_norm_cutlass_v2), ("CuTe v3", rms_norm_cutlass_v3)]:
             res = benchmark_func(fn, x, w, eps)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")

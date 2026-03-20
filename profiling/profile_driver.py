@@ -90,6 +90,7 @@ def _kernels_rms_norm():
     cute_lib = _load_so("operators/rms_norm/cutlass/rms_norm_cutlass.so", {
         "rms_norm_cutlass_v1": (_args, None),
         "rms_norm_cutlass_v2": (_args, None),
+        "rms_norm_cutlass_v3": (_args, None),
     })
 
     def _call(lib, fn):
@@ -106,6 +107,7 @@ def _kernels_rms_norm():
     if cute_lib:
         kernels["cute_v1"] = _call(cute_lib, "rms_norm_cutlass_v1")
         kernels["cute_v2"] = _call(cute_lib, "rms_norm_cutlass_v2")
+        kernels["cute_v3"] = _call(cute_lib, "rms_norm_cutlass_v3")
     return kernels
 
 
