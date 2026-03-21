@@ -192,10 +192,12 @@ def _kernels_layernorm():
     cuda_lib = _load_so("operators/layernorm/cuda/layernorm.so", {
         "layernorm_cuda_v1": (_args, None),
         "layernorm_cuda_v2": (_args, None),
+        "layernorm_cuda_v3": (_args, None),
     })
     cute_lib = _load_so("operators/layernorm/cutlass/layernorm_cutlass.so", {
         "layernorm_cutlass_v1": (_args, None),
         "layernorm_cutlass_v2": (_args, None),
+        "layernorm_cutlass_v3": (_args, None),
     })
 
     def _call(lib, fn):
@@ -208,9 +210,11 @@ def _kernels_layernorm():
     if cuda_lib:
         kernels["cuda_v1"] = _call(cuda_lib, "layernorm_cuda_v1")
         kernels["cuda_v2"] = _call(cuda_lib, "layernorm_cuda_v2")
+        kernels["cuda_v3"] = _call(cuda_lib, "layernorm_cuda_v3")
     if cute_lib:
         kernels["cute_v1"] = _call(cute_lib, "layernorm_cutlass_v1")
         kernels["cute_v2"] = _call(cute_lib, "layernorm_cutlass_v2")
+        kernels["cute_v3"] = _call(cute_lib, "layernorm_cutlass_v3")
     return kernels
 
 

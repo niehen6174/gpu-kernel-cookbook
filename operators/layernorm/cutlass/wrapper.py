@@ -5,7 +5,7 @@ def _load():
     if not os.path.exists(p):
         return None
     lib = ctypes.CDLL(p)
-    for fn in ["layernorm_cutlass_v1", "layernorm_cutlass_v2"]:
+    for fn in ["layernorm_cutlass_v1", "layernorm_cutlass_v2", "layernorm_cutlass_v3"]:
         f = getattr(lib, fn)
         f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                       ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float]
@@ -37,3 +37,7 @@ def layernorm_cutlass_v1(X, weight=None, bias=None):
 def layernorm_cutlass_v2(X, weight=None, bias=None):
     """CuTe v2: Welford + Warp Reduction + CuTe Tensor"""
     return _call("layernorm_cutlass_v2", X, weight, bias)
+
+def layernorm_cutlass_v3(X, weight=None, bias=None):
+    """CuTe v3: float4/LDG.128 + 寄存器缓存 x/w/b + 两路独立 reduce"""
+    return _call("layernorm_cutlass_v3", X, weight, bias)

@@ -212,6 +212,114 @@ __global__ void layernorm_v2_welford(const float* __restrict__ input,
 }
 
 // -------------------------------------------------------------------------
+// V3: float4 向量化 + 寄存器缓存 x/w/b + 两路独立 reduce
+//
+// 核心问题（ncu 分析，B=4096，N=1024）：
+//   v1 DRAM 21%，v2 DRAM 26% —— 均 latency-bound（两者 Memory/Compute < 60%）
+//   v1: scalar load + shared memory block reduce + x 读两次
+//   v2: Welford 每步有串行依赖（delta = x - mean_prev），无法向量化
+//
+// 优化策略：
+//   1. float4 向量化：128-bit load，单次指令处理 4 floats，降低指令发射压力
+//   2. 寄存器缓存 x/w/b：单次 DRAM 读，Pass2 完全从寄存器读取
+//   3. 两路独立 reduce（sum_x + sum_x2）代替 Welford：
+//      - Welford: delta 依赖上一步 mean，存在循环依赖，编译器无法向量化
+//      - 两路: sum_x += x[i], sum_x2 += x[i]² 互相独立，可完全 unroll
+//      - 注意：两路方式在极端值下数值稳定性略逊（但 float32 实际场景无问题）
+//   4. __ldg 走 read-only cache 路径，减少 L1 污染
+// -------------------------------------------------------------------------
+template <int THREADS, int ELEMS_PER_THREAD>
+__global__ void __launch_bounds__(THREADS)
+layernorm_v3(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float*       __restrict__ output,
+    int N, float eps)
+{
+    extern __shared__ float smem[];  // [num_warps: sum_x] [num_warps: sum_x2]
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / 32;
+    int lane      = tid % 32;
+    int num_warps = THREADS / 32;
+    int row       = blockIdx.x;
+    int N4        = N / 4;
+
+    const float4* x4 = reinterpret_cast<const float4*>(input  + row * N);
+    const float4* w4 = reinterpret_cast<const float4*>(weight);
+    const float4* b4 = reinterpret_cast<const float4*>(bias);
+    float4*       y4 = reinterpret_cast<float4*>(output + row * N);
+
+    // Step 1: 全量 load x/w/b 进寄存器，同时计算 sum_x 和 sum_x2
+    float4 rX[ELEMS_PER_THREAD];
+    float4 rW[ELEMS_PER_THREAD];
+    float4 rB[ELEMS_PER_THREAD];
+
+    float local_sum = 0.0f, local_sq = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            rX[e] = __ldg(&x4[i]);
+            rW[e] = __ldg(&w4[i]);
+            rB[e] = __ldg(&b4[i]);
+            local_sum += rX[e].x + rX[e].y + rX[e].z + rX[e].w;
+            local_sq  += rX[e].x*rX[e].x + rX[e].y*rX[e].y
+                       + rX[e].z*rX[e].z + rX[e].w*rX[e].w;
+        }
+    }
+
+    // Step 2: Warp reduce（两路同步进行）
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        local_sum += __shfl_xor_sync(0xffffffff, local_sum, mask);
+        local_sq  += __shfl_xor_sync(0xffffffff, local_sq,  mask);
+    }
+
+    float* s_sum = smem;
+    float* s_sq  = smem + num_warps;
+    if (lane == 0) {
+        s_sum[warp_id] = local_sum;
+        s_sq[warp_id]  = local_sq;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float vs = (lane < num_warps) ? s_sum[lane] : 0.0f;
+        float vq = (lane < num_warps) ? s_sq[lane]  : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            vs += __shfl_xor_sync(0xffffffff, vs, mask);
+            vq += __shfl_xor_sync(0xffffffff, vq, mask);
+        }
+        if (lane == 0) { s_sum[0] = vs; s_sq[0] = vq; }
+    }
+    __syncthreads();
+
+    float mean    = s_sum[0] / N;
+    float var     = s_sq[0]  / N - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+
+    // Step 3: Normalize（完全从寄存器读 x/w/b，零 DRAM/L2 re-read）
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            float4 out;
+            out.x = (rX[e].x - mean) * inv_std * rW[e].x + rB[e].x;
+            out.y = (rX[e].y - mean) * inv_std * rW[e].y + rB[e].y;
+            out.z = (rX[e].z - mean) * inv_std * rW[e].z + rB[e].z;
+            out.w = (rX[e].w - mean) * inv_std * rW[e].w + rB[e].w;
+            y4[i] = out;
+        }
+    }
+    for (int i = N4*4 + tid; i < N; i += THREADS)
+        output[row*N+i] = (__ldg(&input[row*N+i]) - mean) * inv_std
+                          * __ldg(&weight[i]) + __ldg(&bias[i]);
+}
+
+// -------------------------------------------------------------------------
 // Host 函数
 // -------------------------------------------------------------------------
 extern "C" {
@@ -230,6 +338,21 @@ void layernorm_cuda_v2(const float* input, const float* weight, const float* bia
     int threads = 256;
     size_t smem = MAX_WARPS * 3 * sizeof(float);
     layernorm_v2_welford<<<B, threads, smem>>>(input, weight, bias, output, N, eps);
+    cudaDeviceSynchronize();
+}
+
+void layernorm_cuda_v3(const float* input, const float* weight, const float* bias,
+                        float* output, int B, int N, float eps) {
+    // N=1024, threads=256 → ELEMS=1024/(4×256)=1
+    // N=2048  → ELEMS=2; N=4096 → ELEMS=4
+    constexpr int THREADS = 256;
+    int elems = N / (4 * THREADS);
+    size_t smem = 2 * (THREADS / 32) * sizeof(float);
+    if      (elems <= 1) layernorm_v3<THREADS,1><<<B,THREADS,smem>>>(input,weight,bias,output,N,eps);
+    else if (elems == 2) layernorm_v3<THREADS,2><<<B,THREADS,smem>>>(input,weight,bias,output,N,eps);
+    else if (elems == 4) layernorm_v3<THREADS,4><<<B,THREADS,smem>>>(input,weight,bias,output,N,eps);
+    else if (elems == 8) layernorm_v3<THREADS,8><<<B,THREADS,smem>>>(input,weight,bias,output,N,eps);
+    else layernorm_v3<THREADS,1><<<B,THREADS,smem>>>(input,weight,bias,output,N,eps);
     cudaDeviceSynchronize();
 }
 

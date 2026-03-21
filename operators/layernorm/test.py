@@ -23,7 +23,7 @@ def load_cuda_lib():
         print(f"[SKIP] CUDA lib not found: {lib_path}  (run: cd cuda && bash build.sh)")
         return None
     lib = ctypes.CDLL(lib_path)
-    for fn in ["layernorm_cuda_v1", "layernorm_cuda_v2"]:
+    for fn in ["layernorm_cuda_v1", "layernorm_cuda_v2", "layernorm_cuda_v3"]:
         getattr(lib, fn).argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float
@@ -61,14 +61,15 @@ def test_correctness():
 
         lib = load_cuda_lib()
         if lib:
-            for v in ["layernorm_cuda_v1", "layernorm_cuda_v2"]:
+            for v in ["layernorm_cuda_v1", "layernorm_cuda_v2", "layernorm_cuda_v3"]:
                 out = run_cuda(lib, v, X, W, b)
                 check_correctness(out, ref, name=f"CUDA {v.split('_')[-1]} ({B}x{N})")
 
         try:
-            from operators.layernorm.cutlass.wrapper import layernorm_cutlass_v1, layernorm_cutlass_v2
+            from operators.layernorm.cutlass.wrapper import layernorm_cutlass_v1, layernorm_cutlass_v2, layernorm_cutlass_v3
             check_correctness(layernorm_cutlass_v1(X, W, b), ref, name=f"CuTe v1 ({B}x{N})")
             check_correctness(layernorm_cutlass_v2(X, W, b), ref, name=f"CuTe v2 ({B}x{N})")
+            check_correctness(layernorm_cutlass_v3(X, W, b), ref, name=f"CuTe v3 ({B}x{N})")
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
     print()
@@ -98,14 +99,14 @@ def run_benchmark(B=4096, N=1024):
 
     lib = load_cuda_lib()
     if lib:
-        for v in ["layernorm_cuda_v1", "layernorm_cuda_v2"]:
+        for v in ["layernorm_cuda_v1", "layernorm_cuda_v2", "layernorm_cuda_v3"]:
             res = benchmark_func(run_cuda, lib, v, X, W, b)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"CUDA {v.split('_')[-1]:4s}  : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
 
     try:
-        from operators.layernorm.cutlass.wrapper import layernorm_cutlass_v1, layernorm_cutlass_v2
-        for label, fn in [("CuTe v1", layernorm_cutlass_v1), ("CuTe v2", layernorm_cutlass_v2)]:
+        from operators.layernorm.cutlass.wrapper import layernorm_cutlass_v1, layernorm_cutlass_v2, layernorm_cutlass_v3
+        for label, fn in [("CuTe v1", layernorm_cutlass_v1), ("CuTe v2", layernorm_cutlass_v2), ("CuTe v3", layernorm_cutlass_v3)]:
             res = benchmark_func(fn, X, W, b)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
