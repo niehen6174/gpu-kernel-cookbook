@@ -181,6 +181,7 @@ __global__ void rms_norm_v3_impl(
     int lane      = tid % 32;
     int num_warps = blockDim.x / 32;
     int row       = blockIdx.x;
+    int N4        = N / 4;
 
     const float4* x4 = reinterpret_cast<const float4*>(x + row * N);
     const float4* w4 = reinterpret_cast<const float4*>(w);
@@ -193,11 +194,13 @@ __global__ void rms_norm_v3_impl(
     #pragma unroll
     for (int e = 0; e < ELEMS_PER_THREAD; e++) {
         int i = tid + e * blockDim.x;
-        reg_x[e] = x4[i];
-        local_ss += reg_x[e].x * reg_x[e].x
-                  + reg_x[e].y * reg_x[e].y
-                  + reg_x[e].z * reg_x[e].z
-                  + reg_x[e].w * reg_x[e].w;
+        if (i < N4) {
+            reg_x[e] = __ldg(&x4[i]);
+            local_ss += reg_x[e].x * reg_x[e].x
+                      + reg_x[e].y * reg_x[e].y
+                      + reg_x[e].z * reg_x[e].z
+                      + reg_x[e].w * reg_x[e].w;
+        }
     }
 
     // Warp + block reduce
@@ -218,18 +221,118 @@ __global__ void rms_norm_v3_impl(
     #pragma unroll
     for (int e = 0; e < ELEMS_PER_THREAD; e++) {
         int i = tid + e * blockDim.x;
-        float4 wi = __ldg(&w4[i]);
-        float4 out;
-        out.x = reg_x[e].x * rms_inv * wi.x;
-        out.y = reg_x[e].y * rms_inv * wi.y;
-        out.z = reg_x[e].z * rms_inv * wi.z;
-        out.w = reg_x[e].w * rms_inv * wi.w;
-        y4[i] = out;
+        if (i < N4) {
+            float4 wi = __ldg(&w4[i]);
+            float4 out;
+            out.x = reg_x[e].x * rms_inv * wi.x;
+            out.y = reg_x[e].y * rms_inv * wi.y;
+            out.z = reg_x[e].z * rms_inv * wi.z;
+            out.w = reg_x[e].w * rms_inv * wi.w;
+            y4[i] = out;
+        }
+    }
+    // scalar tail for N not divisible by 4
+    for (int i = N4*4 + tid; i < N; i += blockDim.x)
+        y[row*N+i] = __ldg(&x[row*N+i]) * rms_inv * __ldg(&w[i]);
+}
+
+// -------------------------------------------------------------------------
+// fused_add_rms_norm_v3: float4 + register cache (optimized)
+//
+// 相比 v4（scalar two-pass）的改进：
+//   1. float4 向量化：128-bit LDG/STG，减少 75% 指令
+//   2. 寄存器缓存更新后的 residual (r = x + r_old)
+//      Pass 1 load x + r_old → 计算 r = x + r_old → 写回 DRAM，缓存 r 到寄存器
+//      Pass 2 从寄存器读 r，完全零 DRAM re-read
+//   3. __ldg 读 w，走 read-only cache
+//
+// DRAM 访问：x(1R) + residual(1R+1W) + w(1R) + y(1W) = 5 passes
+// 对比 v4：  x(1R) + residual(1R+1W) + residual(1R) + w(1R) + y(1W) = 6 passes
+// -------------------------------------------------------------------------
+template <int ELEMS_PER_THREAD>
+__global__ void __launch_bounds__(256)
+fused_add_rms_norm_v3_impl(
+    const float* __restrict__ x,
+    float*       __restrict__ residual,  // inplace: residual = x + residual
+    const float* __restrict__ w,
+    float*       __restrict__ y,
+    int N, float eps)
+{
+    extern __shared__ float smem[];
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / 32;
+    int lane      = tid % 32;
+    int num_warps = blockDim.x / 32;
+    int row       = blockIdx.x;
+    int N4        = N / 4;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x        + row * N);
+    float4*       r4 = reinterpret_cast<float4*>      (residual + row * N);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    float4*       y4 = reinterpret_cast<float4*>      (y        + row * N);
+
+    float4 rR[ELEMS_PER_THREAD];  // register cache: updated residual
+    float4 rW[ELEMS_PER_THREAD];
+
+    float local_ss = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * blockDim.x;
+        if (i < N4) {
+            float4 xi = __ldg(&x4[i]);
+            float4 ri = __ldg(&r4[i]);
+            // fused add: r = x + residual
+            rR[e].x = xi.x + ri.x;
+            rR[e].y = xi.y + ri.y;
+            rR[e].z = xi.z + ri.z;
+            rR[e].w = xi.w + ri.w;
+            // write updated residual back (single DRAM write)
+            r4[i] = rR[e];
+            // load weight with __ldg
+            rW[e] = __ldg(&w4[i]);
+            // accumulate sum(r²)
+            local_ss += rR[e].x*rR[e].x + rR[e].y*rR[e].y
+                      + rR[e].z*rR[e].z + rR[e].w*rR[e].w;
+        }
+    }
+
+    local_ss = warp_reduce_sum(local_ss);
+    if (lane == 0) smem[warp_id] = local_ss;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane < num_warps) ? smem[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+
+    float rms_inv = rsqrtf(smem[0] / N + eps);
+
+    // Pass 2: normalize from registers (zero DRAM re-read)
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * blockDim.x;
+        if (i < N4) {
+            float4 out;
+            out.x = rR[e].x * rms_inv * rW[e].x;
+            out.y = rR[e].y * rms_inv * rW[e].y;
+            out.z = rR[e].z * rms_inv * rW[e].z;
+            out.w = rR[e].w * rms_inv * rW[e].w;
+            y4[i] = out;
+        }
+    }
+    // scalar tail
+    for (int i = N4*4 + tid; i < N; i += blockDim.x) {
+        float r = __ldg(&x[row*N+i]) + __ldg(&residual[row*N+i]);
+        residual[row*N+i] = r;
+        y[row*N+i] = r * rms_inv * __ldg(&w[i]);
     }
 }
 
 // -------------------------------------------------------------------------
-// V4: Fused residual add + RMSNorm (inplace on residual)
+// V4: Fused residual add + RMSNorm (inplace on residual), scalar baseline
 // -------------------------------------------------------------------------
 __global__ void fused_add_rms_norm_v4(
     float*       __restrict__ x,        // input x
@@ -304,16 +407,11 @@ void rms_norm_cuda_v3(float* x, float* w, float* y, int B, int N, float eps) {
     int threads = 256;
     int elems = N / (4 * threads);
     size_t smem = MAX_WARPS * sizeof(float);
-    if (elems == 4) {
-        rms_norm_v3_impl<4><<<B, threads, smem>>>(x, w, y, N, eps);
-    } else if (elems == 8) {
-        rms_norm_v3_impl<8><<<B, threads, smem>>>(x, w, y, N, eps);
-    } else if (elems == 2) {
-        rms_norm_v3_impl<2><<<B, threads, smem>>>(x, w, y, N, eps);
-    } else {
-        // fallback to v2
-        rms_norm_v2<<<B, threads, smem>>>(x, w, y, N, eps);
-    }
+    if      (elems <= 1) rms_norm_v3_impl<1><<<B, threads, smem>>>(x, w, y, N, eps);
+    else if (elems == 2) rms_norm_v3_impl<2><<<B, threads, smem>>>(x, w, y, N, eps);
+    else if (elems == 4) rms_norm_v3_impl<4><<<B, threads, smem>>>(x, w, y, N, eps);
+    else if (elems == 8) rms_norm_v3_impl<8><<<B, threads, smem>>>(x, w, y, N, eps);
+    else                 rms_norm_v3_impl<1><<<B, threads, smem>>>(x, w, y, N, eps);
     cudaDeviceSynchronize();
 }
 
@@ -322,6 +420,19 @@ void fused_add_rms_norm_cuda(float* x, float* residual, float* w, float* y,
     int threads = 256;
     size_t smem = MAX_WARPS * sizeof(float);
     fused_add_rms_norm_v4<<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    cudaDeviceSynchronize();
+}
+
+void fused_add_rms_norm_cuda_v3(const float* x, float* residual, const float* w, float* y,
+                                 int B, int N, float eps) {
+    int threads = 256;
+    int elems = N / (4 * threads);
+    size_t smem = MAX_WARPS * sizeof(float);
+    if      (elems <= 1) fused_add_rms_norm_v3_impl<1><<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    else if (elems == 2) fused_add_rms_norm_v3_impl<2><<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    else if (elems == 4) fused_add_rms_norm_v3_impl<4><<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    else if (elems == 8) fused_add_rms_norm_v3_impl<8><<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    else                 fused_add_rms_norm_v3_impl<1><<<B, threads, smem>>>(x, residual, w, y, N, eps);
     cudaDeviceSynchronize();
 }
 

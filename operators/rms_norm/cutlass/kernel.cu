@@ -315,16 +315,178 @@ void rms_norm_cutlass_v3(float* x, float* w, float* y, int B, int N, float eps) 
     constexpr int THREADS = 256;
     int elems = N / (4 * THREADS);
     size_t smem = (THREADS / 32) * sizeof(float);
-    if (elems == 4) {
-        rms_norm_cute_v3<THREADS, 4><<<B, THREADS, smem>>>(x, w, y, N, eps);
-    } else if (elems == 8) {
-        rms_norm_cute_v3<THREADS, 8><<<B, THREADS, smem>>>(x, w, y, N, eps);
-    } else if (elems == 2) {
-        rms_norm_cute_v3<THREADS, 2><<<B, THREADS, smem>>>(x, w, y, N, eps);
-    } else {
-        // fallback to v2
-        rms_norm_cute_v2<<<B, THREADS, smem>>>(x, w, y, N, eps);
+    if      (elems <= 1) rms_norm_cute_v3<THREADS, 1><<<B, THREADS, smem>>>(x, w, y, N, eps);
+    else if (elems == 2) rms_norm_cute_v3<THREADS, 2><<<B, THREADS, smem>>>(x, w, y, N, eps);
+    else if (elems == 4) rms_norm_cute_v3<THREADS, 4><<<B, THREADS, smem>>>(x, w, y, N, eps);
+    else if (elems == 8) rms_norm_cute_v3<THREADS, 8><<<B, THREADS, smem>>>(x, w, y, N, eps);
+    else                 rms_norm_cute_v3<THREADS, 1><<<B, THREADS, smem>>>(x, w, y, N, eps);
+    cudaDeviceSynchronize();
+}
+
+} // extern "C"
+
+// =========================================================================
+// Fused Add + RMSNorm — CuTe 实现
+//
+// cute_fused_v1: scalar two-pass，CuTe gmem tensor 包装
+// cute_fused_v3: float4 + register cache，同 cuda_fused_v3 优化思路
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// cute_fused_v1: two-pass scalar
+// -------------------------------------------------------------------------
+__global__ void fused_add_rms_norm_cute_v1(
+    const float* __restrict__ x,
+    float*       __restrict__ residual,
+    const float* __restrict__ w,
+    float*       __restrict__ y,
+    int N, float eps)
+{
+    extern __shared__ float smem[];
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / 32;
+    int lane      = tid % 32;
+    int num_warps = blockDim.x / 32;
+    int row       = blockIdx.x;
+
+    auto gX = make_tensor(make_gmem_ptr(x        + row * N), make_layout(N));
+    auto gR = make_tensor(make_gmem_ptr(residual + row * N), make_layout(N));
+    auto gW = make_tensor(make_gmem_ptr(w),                  make_layout(N));
+    auto gY = make_tensor(make_gmem_ptr(y        + row * N), make_layout(N));
+
+    // Pass 1: fused add → residual inplace, accumulate sum(r²)
+    float local_ss = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float r = gX(i) + gR(i);
+        gR(i) = r;
+        local_ss += r * r;
     }
+
+    local_ss = warp_reduce_sum(local_ss);
+    if (lane == 0) smem[warp_id] = local_ss;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane < num_warps) ? smem[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+
+    float rms_inv = rsqrtf(smem[0] / N + eps);
+
+    // Pass 2: normalize from updated residual (DRAM re-read)
+    for (int i = tid; i < N; i += blockDim.x)
+        gY(i) = gR(i) * rms_inv * gW(i);
+}
+
+// -------------------------------------------------------------------------
+// cute_fused_v3: float4 + register cache updated residual + __ldg weight
+// -------------------------------------------------------------------------
+template <int THREADS, int ELEMS_PER_THREAD>
+__global__ void __launch_bounds__(THREADS)
+fused_add_rms_norm_cute_v3(
+    const float* __restrict__ x,
+    float*       __restrict__ residual,
+    const float* __restrict__ w,
+    float*       __restrict__ y,
+    int N, float eps)
+{
+    extern __shared__ float smem[];
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / 32;
+    int lane      = tid % 32;
+    int num_warps = THREADS / 32;
+    int row       = blockIdx.x;
+    int N4        = N / 4;
+
+    auto gX = make_tensor(make_gmem_ptr(reinterpret_cast<const float4*>(x        + row*N)), make_layout(N4));
+    auto gR = make_tensor(make_gmem_ptr(reinterpret_cast<float4*>      (residual + row*N)), make_layout(N4));
+    auto gW = make_tensor(make_gmem_ptr(reinterpret_cast<const float4*>(w)),                make_layout(N4));
+    auto gY = make_tensor(make_gmem_ptr(reinterpret_cast<float4*>      (y        + row*N)), make_layout(N4));
+
+    float4 rR[ELEMS_PER_THREAD];  // register cache: updated residual
+    float4 rW[ELEMS_PER_THREAD];
+
+    float local_ss = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            float4 xi = gX(i);
+            float4 ri = gR(i);
+            rR[e].x = xi.x + ri.x;
+            rR[e].y = xi.y + ri.y;
+            rR[e].z = xi.z + ri.z;
+            rR[e].w = xi.w + ri.w;
+            gR(i) = rR[e];         // write updated residual
+            rW[e] = gW(i);
+            local_ss += rR[e].x*rR[e].x + rR[e].y*rR[e].y
+                      + rR[e].z*rR[e].z + rR[e].w*rR[e].w;
+        }
+    }
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        local_ss += __shfl_xor_sync(0xffffffff, local_ss, mask);
+
+    if (lane == 0) smem[warp_id] = local_ss;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane < num_warps) ? smem[lane] : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            val += __shfl_xor_sync(0xffffffff, val, mask);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+
+    float rms_inv = rsqrtf(smem[0] / N + eps);
+
+    // Pass 2: from registers, zero DRAM re-read
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            float4 out;
+            out.x = rR[e].x * rms_inv * rW[e].x;
+            out.y = rR[e].y * rms_inv * rW[e].y;
+            out.z = rR[e].z * rms_inv * rW[e].z;
+            out.w = rR[e].w * rms_inv * rW[e].w;
+            gY(i) = out;
+        }
+    }
+    // scalar tail
+    for (int i = N4*4 + tid; i < N; i += THREADS) {
+        float r = __ldg(&x[row*N+i]) + __ldg(&residual[row*N+i]);
+        residual[row*N+i] = r;
+        y[row*N+i] = r * rms_inv * __ldg(&w[i]);
+    }
+}
+
+extern "C" {
+
+void fused_add_rms_norm_cutlass_v1(float* x, float* residual, float* w, float* y,
+                                    int B, int N, float eps) {
+    int threads = 256;
+    size_t smem = MAX_WARPS * sizeof(float);
+    fused_add_rms_norm_cute_v1<<<B, threads, smem>>>(x, residual, w, y, N, eps);
+    cudaDeviceSynchronize();
+}
+
+void fused_add_rms_norm_cutlass_v3(const float* x, float* residual, const float* w, float* y,
+                                    int B, int N, float eps) {
+    constexpr int THREADS = 256;
+    int elems = N / (4 * THREADS);
+    size_t smem = (THREADS / 32) * sizeof(float);
+    if      (elems <= 1) fused_add_rms_norm_cute_v3<THREADS,1><<<B,THREADS,smem>>>(x,residual,w,y,N,eps);
+    else if (elems == 2) fused_add_rms_norm_cute_v3<THREADS,2><<<B,THREADS,smem>>>(x,residual,w,y,N,eps);
+    else if (elems == 4) fused_add_rms_norm_cute_v3<THREADS,4><<<B,THREADS,smem>>>(x,residual,w,y,N,eps);
+    else if (elems == 8) fused_add_rms_norm_cute_v3<THREADS,8><<<B,THREADS,smem>>>(x,residual,w,y,N,eps);
+    else                 fused_add_rms_norm_cute_v3<THREADS,1><<<B,THREADS,smem>>>(x,residual,w,y,N,eps);
     cudaDeviceSynchronize();
 }
 

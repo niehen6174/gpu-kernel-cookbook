@@ -80,17 +80,24 @@ def _kernels_rms_norm():
     x = torch.randn(B, N, device="cuda").contiguous()
     w = torch.randn(N, device="cuda").contiguous()
     y = torch.empty(B, N, device="cuda")
+    r = torch.randn(B, N, device="cuda").contiguous()   # residual for fused
 
-    _args = [ctypes.c_void_p] * 3 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    _rn_args    = [ctypes.c_void_p] * 3 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    _fused_args = [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
     cuda_lib = _load_so("operators/rms_norm/cuda/rms_norm.so", {
-        "rms_norm_cuda_v1": (_args, None),
-        "rms_norm_cuda_v2": (_args, None),
-        "rms_norm_cuda_v3": (_args, None),
+        "rms_norm_cuda_v1":           (_rn_args,    None),
+        "rms_norm_cuda_v2":           (_rn_args,    None),
+        "rms_norm_cuda_v3":           (_rn_args,    None),
+        "fused_add_rms_norm_cuda":    (_fused_args, None),
+        "fused_add_rms_norm_cuda_v3": (_fused_args, None),
     })
     cute_lib = _load_so("operators/rms_norm/cutlass/rms_norm_cutlass.so", {
-        "rms_norm_cutlass_v1": (_args, None),
-        "rms_norm_cutlass_v2": (_args, None),
-        "rms_norm_cutlass_v3": (_args, None),
+        "rms_norm_cutlass_v1":              (_rn_args,    None),
+        "rms_norm_cutlass_v2":              (_rn_args,    None),
+        "rms_norm_cutlass_v3":              (_rn_args,    None),
+        "fused_add_rms_norm_cutlass_v1":    (_fused_args, None),
+        "fused_add_rms_norm_cutlass_v3":    (_fused_args, None),
     })
 
     def _call(lib, fn):
@@ -99,15 +106,26 @@ def _kernels_rms_norm():
             ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-6)
         )
 
+    def _call_fused(lib, fn):
+        r_buf = r.clone()
+        return lambda: getattr(lib, fn)(
+            x.data_ptr(), r_buf.data_ptr(), w.data_ptr(), y.data_ptr(),
+            ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-6)
+        )
+
     kernels = {}
     if cuda_lib:
-        kernels["cuda_v1"] = _call(cuda_lib, "rms_norm_cuda_v1")
-        kernels["cuda_v2"] = _call(cuda_lib, "rms_norm_cuda_v2")
-        kernels["cuda_v3"] = _call(cuda_lib, "rms_norm_cuda_v3")
+        kernels["cuda_v1"]         = _call(cuda_lib, "rms_norm_cuda_v1")
+        kernels["cuda_v2"]         = _call(cuda_lib, "rms_norm_cuda_v2")
+        kernels["cuda_v3"]         = _call(cuda_lib, "rms_norm_cuda_v3")
+        kernels["cuda_fused_v1"]   = _call_fused(cuda_lib, "fused_add_rms_norm_cuda")
+        kernels["cuda_fused_v3"]   = _call_fused(cuda_lib, "fused_add_rms_norm_cuda_v3")
     if cute_lib:
-        kernels["cute_v1"] = _call(cute_lib, "rms_norm_cutlass_v1")
-        kernels["cute_v2"] = _call(cute_lib, "rms_norm_cutlass_v2")
-        kernels["cute_v3"] = _call(cute_lib, "rms_norm_cutlass_v3")
+        kernels["cute_v1"]         = _call(cute_lib, "rms_norm_cutlass_v1")
+        kernels["cute_v2"]         = _call(cute_lib, "rms_norm_cutlass_v2")
+        kernels["cute_v3"]         = _call(cute_lib, "rms_norm_cutlass_v3")
+        kernels["cute_fused_v1"]   = _call_fused(cute_lib, "fused_add_rms_norm_cutlass_v1")
+        kernels["cute_fused_v3"]   = _call_fused(cute_lib, "fused_add_rms_norm_cutlass_v3")
     return kernels
 
 
