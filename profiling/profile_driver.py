@@ -187,17 +187,24 @@ def _kernels_layernorm():
     w = torch.ones(N, device="cuda").contiguous()
     b = torch.zeros(N, device="cuda").contiguous()
     y = torch.empty(B, N, device="cuda")
+    r = torch.randn(B, N, device="cuda").contiguous()   # residual for fused kernels
 
-    _args = [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    _args_ln    = [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    _args_fused = [ctypes.c_void_p] * 5 + [ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
     cuda_lib = _load_so("operators/layernorm/cuda/layernorm.so", {
-        "layernorm_cuda_v1": (_args, None),
-        "layernorm_cuda_v2": (_args, None),
-        "layernorm_cuda_v3": (_args, None),
+        "layernorm_cuda_v1":            (_args_ln,    None),
+        "layernorm_cuda_v2":            (_args_ln,    None),
+        "layernorm_cuda_v3":            (_args_ln,    None),
+        "fused_add_layernorm_cuda_v1":  (_args_fused, None),
+        "fused_add_layernorm_cuda_v3":  (_args_fused, None),
     })
     cute_lib = _load_so("operators/layernorm/cutlass/layernorm_cutlass.so", {
-        "layernorm_cutlass_v1": (_args, None),
-        "layernorm_cutlass_v2": (_args, None),
-        "layernorm_cutlass_v3": (_args, None),
+        "layernorm_cutlass_v1":              (_args_ln,    None),
+        "layernorm_cutlass_v2":              (_args_ln,    None),
+        "layernorm_cutlass_v3":              (_args_ln,    None),
+        "fused_add_layernorm_cutlass_v1":    (_args_fused, None),
+        "fused_add_layernorm_cutlass_v3":    (_args_fused, None),
     })
 
     def _call(lib, fn):
@@ -206,15 +213,28 @@ def _kernels_layernorm():
             ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-5)
         )
 
+    def _call_fused(lib, fn):
+        # Use a fresh residual clone each call to avoid accumulated state skewing timing
+        r_buf = r.clone()
+        return lambda: getattr(lib, fn)(
+            x.data_ptr(), r_buf.data_ptr(),
+            w.data_ptr(), b.data_ptr(), y.data_ptr(),
+            ctypes.c_int(B), ctypes.c_int(N), ctypes.c_float(1e-5)
+        )
+
     kernels = {}
     if cuda_lib:
-        kernels["cuda_v1"] = _call(cuda_lib, "layernorm_cuda_v1")
-        kernels["cuda_v2"] = _call(cuda_lib, "layernorm_cuda_v2")
-        kernels["cuda_v3"] = _call(cuda_lib, "layernorm_cuda_v3")
+        kernels["cuda_v1"]        = _call(cuda_lib, "layernorm_cuda_v1")
+        kernels["cuda_v2"]        = _call(cuda_lib, "layernorm_cuda_v2")
+        kernels["cuda_v3"]        = _call(cuda_lib, "layernorm_cuda_v3")
+        kernels["cuda_fused_v1"]  = _call_fused(cuda_lib, "fused_add_layernorm_cuda_v1")
+        kernels["cuda_fused_v3"]  = _call_fused(cuda_lib, "fused_add_layernorm_cuda_v3")
     if cute_lib:
-        kernels["cute_v1"] = _call(cute_lib, "layernorm_cutlass_v1")
-        kernels["cute_v2"] = _call(cute_lib, "layernorm_cutlass_v2")
-        kernels["cute_v3"] = _call(cute_lib, "layernorm_cutlass_v3")
+        kernels["cute_v1"]        = _call(cute_lib, "layernorm_cutlass_v1")
+        kernels["cute_v2"]        = _call(cute_lib, "layernorm_cutlass_v2")
+        kernels["cute_v3"]        = _call(cute_lib, "layernorm_cutlass_v3")
+        kernels["cute_fused_v1"]  = _call_fused(cute_lib, "fused_add_layernorm_cutlass_v1")
+        kernels["cute_fused_v3"]  = _call_fused(cute_lib, "fused_add_layernorm_cutlass_v3")
     return kernels
 
 

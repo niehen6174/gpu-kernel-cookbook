@@ -299,3 +299,188 @@ void layernorm_cutlass_v3(const float* input, const float* weight, const float* 
 }
 
 }  // extern "C"
+
+// -------------------------------------------------------------------------
+// fused_add_layernorm_cute_v1: CuTe Tensor 包装 + two-pass
+// -------------------------------------------------------------------------
+__global__ void fused_add_layernorm_cute_v1_kernel(
+    const float* __restrict__ x,
+    float*       __restrict__ residual,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float*       __restrict__ output,
+    int N, float eps)
+{
+    extern __shared__ float smem[];
+    float* s_sum = smem;
+    float* s_sq  = smem + blockDim.x;
+
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+    auto gX = make_tensor(make_gmem_ptr(x        + row * N), make_layout(N));
+    auto gR = make_tensor(make_gmem_ptr(residual + row * N), make_layout(N));
+    auto gY = make_tensor(make_gmem_ptr(output   + row * N), make_layout(N));
+
+    // Pass 1: fused add → residual inplace, accumulate stats
+    float local_sum = 0.0f, local_sq = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float ri = gX(i) + gR(i);
+        gR(i)     = ri;
+        local_sum += ri;
+        local_sq  += ri * ri;
+    }
+    s_sum[tid] = local_sum;
+    s_sq[tid]  = local_sq;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sq[tid]  += s_sq[tid  + s];
+        }
+        __syncthreads();
+    }
+
+    float mean    = s_sum[0] / N;
+    float var     = s_sq[0]  / N - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+    __syncthreads();
+
+    // Pass 2: normalize from updated residual
+    for (int i = tid; i < N; i += blockDim.x) {
+        float norm = (gR(i) - mean) * inv_std;
+        gY(i) = (weight ? weight[i] * norm : norm)
+              + (bias   ? bias[i]           : 0.0f);
+    }
+}
+
+// -------------------------------------------------------------------------
+// fused_add_layernorm_cute_v3: CuTe gmem tensor + float4 + register cache
+// -------------------------------------------------------------------------
+template <int THREADS, int ELEMS_PER_THREAD>
+__global__ void __launch_bounds__(THREADS)
+fused_add_layernorm_cute_v3_kernel(
+    const float* __restrict__ x,
+    float*       __restrict__ residual,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float*       __restrict__ output,
+    int N, float eps)
+{
+    extern __shared__ float smem[];
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / 32;
+    int lane      = tid % 32;
+    int num_warps = THREADS / 32;
+    int row       = blockIdx.x;
+    int N4        = N / 4;
+
+    auto gX = make_tensor(make_gmem_ptr(reinterpret_cast<const float4*>(x        + row*N)), make_layout(N4));
+    auto gR = make_tensor(make_gmem_ptr(reinterpret_cast<float4*>      (residual + row*N)), make_layout(N4));
+    auto gW = make_tensor(make_gmem_ptr(reinterpret_cast<const float4*>(weight)),           make_layout(N4));
+    auto gB = make_tensor(make_gmem_ptr(reinterpret_cast<const float4*>(bias)),             make_layout(N4));
+    auto gY = make_tensor(make_gmem_ptr(reinterpret_cast<float4*>      (output   + row*N)), make_layout(N4));
+
+    float4 rR[ELEMS_PER_THREAD];  // updated residual (x + r)
+    float4 rW[ELEMS_PER_THREAD];
+    float4 rB[ELEMS_PER_THREAD];
+
+    float local_sum = 0.0f, local_sq = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            float4 xi = gX(i);
+            float4 ri = gR(i);
+            rR[e].x = xi.x + ri.x;
+            rR[e].y = xi.y + ri.y;
+            rR[e].z = xi.z + ri.z;
+            rR[e].w = xi.w + ri.w;
+            gR(i) = rR[e];   // write updated residual
+            rW[e] = gW(i);
+            rB[e] = gB(i);
+            local_sum += rR[e].x + rR[e].y + rR[e].z + rR[e].w;
+            local_sq  += rR[e].x*rR[e].x + rR[e].y*rR[e].y
+                       + rR[e].z*rR[e].z + rR[e].w*rR[e].w;
+        }
+    }
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        local_sum += __shfl_xor_sync(0xffffffff, local_sum, mask);
+        local_sq  += __shfl_xor_sync(0xffffffff, local_sq,  mask);
+    }
+    float* s_sum = smem;
+    float* s_sq  = smem + num_warps;
+    if (lane == 0) { s_sum[warp_id] = local_sum; s_sq[warp_id] = local_sq; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float vs = (lane < num_warps) ? s_sum[lane] : 0.0f;
+        float vq = (lane < num_warps) ? s_sq[lane]  : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            vs += __shfl_xor_sync(0xffffffff, vs, mask);
+            vq += __shfl_xor_sync(0xffffffff, vq, mask);
+        }
+        if (lane == 0) { s_sum[0] = vs; s_sq[0] = vq; }
+    }
+    __syncthreads();
+
+    float mean    = s_sum[0] / N;
+    float var     = s_sq[0]  / N - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+
+    #pragma unroll
+    for (int e = 0; e < ELEMS_PER_THREAD; e++) {
+        int i = tid + e * THREADS;
+        if (i < N4) {
+            float4 out;
+            out.x = (rR[e].x - mean) * inv_std * rW[e].x + rB[e].x;
+            out.y = (rR[e].y - mean) * inv_std * rW[e].y + rB[e].y;
+            out.z = (rR[e].z - mean) * inv_std * rW[e].z + rB[e].z;
+            out.w = (rR[e].w - mean) * inv_std * rW[e].w + rB[e].w;
+            gY(i) = out;
+        }
+    }
+    for (int i = N4*4 + tid; i < N; i += THREADS) {
+        float fused = __ldg(&x[row*N+i]) + __ldg(&residual[row*N+i]);
+        residual[row*N+i] = fused;
+        output[row*N+i] = (fused - mean) * inv_std * __ldg(&weight[i]) + __ldg(&bias[i]);
+    }
+}
+
+extern "C" {
+
+void fused_add_layernorm_cutlass_v1(
+    const float* x, float* residual,
+    const float* weight, const float* bias,
+    float* output, int B, int N, float eps)
+{
+    int threads = min(1024, N);
+    int t = 1; while (t < threads) t <<= 1; threads = t;
+    size_t smem = 2 * threads * sizeof(float);
+    fused_add_layernorm_cute_v1_kernel<<<B, threads, smem>>>(
+        x, residual, weight, bias, output, N, eps);
+    cudaDeviceSynchronize();
+}
+
+void fused_add_layernorm_cutlass_v3(
+    const float* x, float* residual,
+    const float* weight, const float* bias,
+    float* output, int B, int N, float eps)
+{
+    constexpr int THREADS = 256;
+    int elems = N / (4 * THREADS);
+    size_t smem = 2 * (THREADS / 32) * sizeof(float);
+    if      (elems <= 1) fused_add_layernorm_cute_v3_kernel<THREADS,1><<<B,THREADS,smem>>>(x,residual,weight,bias,output,N,eps);
+    else if (elems == 2) fused_add_layernorm_cute_v3_kernel<THREADS,2><<<B,THREADS,smem>>>(x,residual,weight,bias,output,N,eps);
+    else if (elems == 4) fused_add_layernorm_cute_v3_kernel<THREADS,4><<<B,THREADS,smem>>>(x,residual,weight,bias,output,N,eps);
+    else if (elems == 8) fused_add_layernorm_cute_v3_kernel<THREADS,8><<<B,THREADS,smem>>>(x,residual,weight,bias,output,N,eps);
+    else                 fused_add_layernorm_cute_v3_kernel<THREADS,1><<<B,THREADS,smem>>>(x,residual,weight,bias,output,N,eps);
+    cudaDeviceSynchronize();
+}
+
+}  // extern "C"
