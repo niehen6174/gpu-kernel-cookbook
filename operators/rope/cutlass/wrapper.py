@@ -11,7 +11,7 @@ def _load():
              ctypes.c_void_p, ctypes.c_void_p,
              ctypes.c_void_p,
              ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    for fn in ["rope_cutlass_v1", "rope_cutlass_v2"]:
+    for fn in ["rope_cutlass_v1", "rope_cutlass_v2", "rope_cutlass_v3"]:
         f = getattr(lib, fn)
         f.argtypes = _args
         f.restype = None
@@ -48,3 +48,7 @@ def rope_cutlass_v1(q, k, cos_cache, sin_cache, positions):
 def rope_cutlass_v2(q, k, cos_cache, sin_cache, positions):
     """CuTe v2: float2 向量化"""
     return _call("rope_cutlass_v2", q, k, cos_cache, sin_cache, positions)
+
+def rope_cutlass_v3(q, k, cos_cache, sin_cache, positions):
+    """CuTe v3: shared cos/sin + all-heads-per-block (1 block/token)"""
+    return _call("rope_cutlass_v3", q, k, cos_cache, sin_cache, positions)

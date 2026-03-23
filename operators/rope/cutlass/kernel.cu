@@ -118,6 +118,71 @@ __global__ void rope_cute_v2(
 }
 
 // -------------------------------------------------------------------------
+// V3: CuTe + shared cos/sin + all-heads-per-block
+//
+// 相比 V1/V2（每 block = 1 (token,head) 对）的改进：
+//   1. 1 block per token，grid = seq_len（减少 num_heads 倍 block 数）
+//   2. cos/sin 整行载入 shared memory，num_heads 个 head 共享复用
+//   3. threads = num_heads * half_dim（通常 1024），完整 warp 处理每个 head
+//   4. 用 CuTe Tensor 包装 smem cos/sin 以及 Q/K 当前 head 视图
+// -------------------------------------------------------------------------
+__global__ void rope_cute_v3(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    const int*   __restrict__ positions,
+    int seq_len, int num_heads, int head_dim)
+{
+    extern __shared__ float smem[];
+
+    int token_idx = blockIdx.x;
+    int half_dim  = head_dim / 2;
+    int tid       = threadIdx.x;
+
+    // CuTe Tensor 包装 shared memory cos/sin
+    float* s_cos_ptr = smem;
+    float* s_sin_ptr = smem + half_dim;
+
+    auto s_cos = make_tensor(make_smem_ptr(s_cos_ptr), make_layout(half_dim));
+    auto s_sin = make_tensor(make_smem_ptr(s_sin_ptr), make_layout(half_dim));
+
+    // 协作加载该 token 的 cos/sin 行
+    int pos = positions[token_idx];
+    auto g_cos = make_tensor(make_gmem_ptr(cos_cache + pos * half_dim), make_layout(half_dim));
+    auto g_sin = make_tensor(make_gmem_ptr(sin_cache + pos * half_dim), make_layout(half_dim));
+
+    for (int i = tid; i < half_dim; i += blockDim.x) {
+        s_cos(i) = g_cos(i);
+        s_sin(i) = g_sin(i);
+    }
+    __syncthreads();
+
+    // 每线程处理 1 个 (head, lane) 元素
+    int total = num_heads * half_dim;
+    for (int t = tid; t < total; t += blockDim.x) {
+        int head_idx = t / half_dim;
+        int lane     = t % half_dim;
+
+        float c  = s_cos(lane);
+        float sv = s_sin(lane);
+
+        // CuTe Tensor 包装当前 head 的 head_dim 元素
+        int offset = (token_idx * num_heads + head_idx) * head_dim;
+        auto qhead = make_tensor(make_gmem_ptr(q + offset), make_layout(head_dim));
+        auto khead = make_tensor(make_gmem_ptr(k + offset), make_layout(head_dim));
+
+        float q1 = qhead(lane), q2 = qhead(lane + half_dim);
+        qhead(lane)            = q1 * c - q2 * sv;
+        qhead(lane + half_dim) = q2 * c + q1 * sv;
+
+        float k1 = khead(lane), k2 = khead(lane + half_dim);
+        khead(lane)            = k1 * c - k2 * sv;
+        khead(lane + half_dim) = k2 * c + k1 * sv;
+    }
+}
+
+// -------------------------------------------------------------------------
 // Host 函数
 // -------------------------------------------------------------------------
 extern "C" {
@@ -143,6 +208,20 @@ void rope_cutlass_v2(float* q, float* k,
     int total_blocks = seq_len * num_heads;
     int threads = half_dim / 2;
     rope_cute_v2<<<total_blocks, threads>>>(
+        q, k, cos_cache, sin_cache, positions,
+        seq_len, num_heads, head_dim);
+    cudaDeviceSynchronize();
+}
+
+void rope_cutlass_v3(float* q, float* k,
+                     float* cos_cache, float* sin_cache,
+                     int* positions,
+                     int seq_len, int num_heads, int head_dim) {
+    int half_dim = head_dim / 2;
+    int threads  = min(1024, num_heads * half_dim);
+    int grid     = seq_len;
+    size_t smem  = 2 * half_dim * sizeof(float);
+    rope_cute_v3<<<grid, threads, smem>>>(
         q, k, cos_cache, sin_cache, positions,
         seq_len, num_heads, head_dim);
     cudaDeviceSynchronize();

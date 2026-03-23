@@ -118,6 +118,74 @@ __global__ void rope_v2(
 }
 
 // -------------------------------------------------------------------------
+// V3: All heads per block, shared cos/sin cache
+//
+// 核心优化：
+//   V1/V2 每 block = 1 (token, head) 对，grid = seq_len * num_heads (131072)
+//   每个 block 独立读相同 token 的 cos/sin 行（32 个 head 重复读）
+//
+//   V3 每 block = 1 token，grid = seq_len (4096)
+//   1. cos/sin 整行读入 shared memory，32 个 head 共享 → 32× L1 复用
+//   2. threads = num_heads * half_dim（如 32×32=1024）= 32 个完整 warp
+//      每 warp 恰好处理一个 head，fully coalesced
+//   3. grid 减小 32×，kernel launch 调度开销降低
+// -------------------------------------------------------------------------
+__global__ void rope_v3(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    const int*   __restrict__ positions,
+    int seq_len, int num_heads, int head_dim)
+{
+    extern __shared__ float smem[];   // 2 * half_dim floats
+
+    int token_idx = blockIdx.x;
+    int half_dim  = head_dim / 2;
+    int tid       = threadIdx.x;
+
+    float* s_cos = smem;
+    float* s_sin = smem + half_dim;
+
+    // 协作加载该 token 的 cos/sin 行到 shared memory
+    int pos = positions[token_idx];
+    const float* cos_row = cos_cache + pos * half_dim;
+    const float* sin_row = sin_cache + pos * half_dim;
+
+    for (int i = tid; i < half_dim; i += blockDim.x) {
+        s_cos[i] = cos_row[i];
+        s_sin[i] = sin_row[i];
+    }
+    __syncthreads();
+
+    // 每线程处理一个 (head, lane) 元素
+    // 线程排布：tid = head_idx * half_dim + lane
+    // → warp i 处理 head i（完整 warp，coalesced 访存）
+    int total = num_heads * half_dim;
+    for (int t = tid; t < total; t += blockDim.x) {
+        int head_idx = t / half_dim;
+        int lane     = t % half_dim;
+
+        float c = s_cos[lane];
+        float sv = s_sin[lane];
+
+        int base = (token_idx * num_heads + head_idx) * head_dim;
+
+        // Q
+        float q1 = q[base + lane];
+        float q2 = q[base + lane + half_dim];
+        q[base + lane]            = q1 * c - q2 * sv;
+        q[base + lane + half_dim] = q2 * c + q1 * sv;
+
+        // K
+        float k1 = k[base + lane];
+        float k2 = k[base + lane + half_dim];
+        k[base + lane]            = k1 * c - k2 * sv;
+        k[base + lane + half_dim] = k2 * c + k1 * sv;
+    }
+}
+
+// -------------------------------------------------------------------------
 // Host 函数
 // -------------------------------------------------------------------------
 extern "C" {
@@ -143,6 +211,21 @@ void rope_cuda_v2(float* q, float* k,
     int total_blocks = seq_len * num_heads;
     int threads = half_dim / 2;  // each thread handles 2 pairs
     rope_v2<<<total_blocks, threads>>>(
+        q, k, cos_cache, sin_cache, positions,
+        seq_len, num_heads, head_dim);
+    cudaDeviceSynchronize();
+}
+
+void rope_cuda_v3(float* q, float* k,
+                  float* cos_cache, float* sin_cache,
+                  int* positions,
+                  int seq_len, int num_heads, int head_dim) {
+    int half_dim = head_dim / 2;
+    // threads = num_heads * half_dim，通常 = 1024（32 heads × 32 half_dim）
+    int threads  = min(1024, num_heads * half_dim);
+    int grid     = seq_len;
+    size_t smem  = 2 * half_dim * sizeof(float);
+    rope_v3<<<grid, threads, smem>>>(
         q, k, cos_cache, sin_cache, positions,
         seq_len, num_heads, head_dim);
     cudaDeviceSynchronize();

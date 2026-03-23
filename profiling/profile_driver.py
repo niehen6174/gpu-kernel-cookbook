@@ -142,10 +142,12 @@ def _kernels_rope():
     cuda_lib = _load_so("operators/rope/cuda/rope.so", {
         "rope_cuda_v1": (_args, None),
         "rope_cuda_v2": (_args, None),
+        "rope_cuda_v3": (_args, None),
     })
     cute_lib = _load_so("operators/rope/cutlass/rope_cutlass.so", {
         "rope_cutlass_v1": (_args, None),
         "rope_cutlass_v2": (_args, None),
+        "rope_cutlass_v3": (_args, None),
     })
 
     def _call(lib, fn):
@@ -160,9 +162,11 @@ def _kernels_rope():
     if cuda_lib:
         kernels["cuda_v1"] = _call(cuda_lib, "rope_cuda_v1")
         kernels["cuda_v2"] = _call(cuda_lib, "rope_cuda_v2")
+        kernels["cuda_v3"] = _call(cuda_lib, "rope_cuda_v3")
     if cute_lib:
         kernels["cute_v1"] = _call(cute_lib, "rope_cutlass_v1")
         kernels["cute_v2"] = _call(cute_lib, "rope_cutlass_v2")
+        kernels["cute_v3"] = _call(cute_lib, "rope_cutlass_v3")
     return kernels
 
 

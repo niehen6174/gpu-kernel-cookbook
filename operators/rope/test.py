@@ -31,7 +31,7 @@ def load_cuda_lib():
              ctypes.c_void_p, ctypes.c_void_p,
              ctypes.c_void_p,
              ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    for fn in ["rope_cuda_v1", "rope_cuda_v2"]:
+    for fn in ["rope_cuda_v1", "rope_cuda_v2", "rope_cuda_v3"]:
         getattr(lib, fn).argtypes = _args
         getattr(lib, fn).restype = None
     return lib
@@ -78,20 +78,23 @@ def test_correctness():
         # CUDA
         lib = load_cuda_lib()
         if lib:
-            for v in ["rope_cuda_v1", "rope_cuda_v2"]:
+            for v in ["rope_cuda_v1", "rope_cuda_v2", "rope_cuda_v3"]:
                 cq, ck = run_cuda_rope(lib, v, q, k, cos_cache, sin_cache, positions)
                 check_correctness(cq, ref_q, name=f"CUDA {v.split('_')[-1]} Q ({seq_len})", atol=1e-5)
                 check_correctness(ck, ref_k, name=f"CUDA {v.split('_')[-1]} K ({seq_len})", atol=1e-5)
 
         # CuTe
         try:
-            from operators.rope.cutlass.wrapper import rope_cutlass_v1, rope_cutlass_v2
+            from operators.rope.cutlass.wrapper import rope_cutlass_v1, rope_cutlass_v2, rope_cutlass_v3
             cq, ck = rope_cutlass_v1(q, k, cos_cache, sin_cache, positions)
             check_correctness(cq, ref_q, name=f"CuTe v1 Q ({seq_len})", atol=1e-5)
             check_correctness(ck, ref_k, name=f"CuTe v1 K ({seq_len})", atol=1e-5)
             cq, ck = rope_cutlass_v2(q, k, cos_cache, sin_cache, positions)
             check_correctness(cq, ref_q, name=f"CuTe v2 Q ({seq_len})", atol=1e-5)
             check_correctness(ck, ref_k, name=f"CuTe v2 K ({seq_len})", atol=1e-5)
+            cq, ck = rope_cutlass_v3(q, k, cos_cache, sin_cache, positions)
+            check_correctness(cq, ref_q, name=f"CuTe v3 Q ({seq_len})", atol=1e-5)
+            check_correctness(ck, ref_k, name=f"CuTe v3 K ({seq_len})", atol=1e-5)
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
 
@@ -128,14 +131,14 @@ def run_benchmark(seq_len=4096, num_heads=32, head_dim=64):
 
     lib = load_cuda_lib()
     if lib:
-        for v in ["rope_cuda_v1", "rope_cuda_v2"]:
+        for v in ["rope_cuda_v1", "rope_cuda_v2", "rope_cuda_v3"]:
             res = benchmark_func(run_cuda_rope, lib, v, q, k, cos_cache, sin_cache, positions)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"CUDA {v.split('_')[-1]:4s}  : {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
 
     try:
-        from operators.rope.cutlass.wrapper import rope_cutlass_v1, rope_cutlass_v2
-        for label, fn in [("CuTe v1", rope_cutlass_v1), ("CuTe v2", rope_cutlass_v2)]:
+        from operators.rope.cutlass.wrapper import rope_cutlass_v1, rope_cutlass_v2, rope_cutlass_v3
+        for label, fn in [("CuTe v1", rope_cutlass_v1), ("CuTe v2", rope_cutlass_v2), ("CuTe v3", rope_cutlass_v3)]:
             res = benchmark_func(fn, q, k, cos_cache, sin_cache, positions)
             bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
