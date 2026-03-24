@@ -90,6 +90,13 @@ def test_correctness():
             check_correctness(layernorm_cutlass_v3(X, W, b), ref, name=f"CuTe v3 ({B}x{N})")
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
+
+        try:
+            from operators.layernorm.cute.kernel import layernorm_cutedsl_v1, layernorm_cutedsl_v2
+            check_correctness(layernorm_cutedsl_v1(X, W, b), ref, name=f"CuteDSL v1 ({B}x{N})")
+            check_correctness(layernorm_cutedsl_v2(X, W, b), ref, name=f"CuteDSL v2 ({B}x{N})")
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
     # ---- fused_add_layernorm correctness ----
@@ -164,6 +171,15 @@ def run_benchmark(B=4096, N=1024):
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.layernorm.cute.kernel import layernorm_cutedsl_v1, layernorm_cutedsl_v2
+        for label, fn in [("CuteDSL v1", layernorm_cutedsl_v1), ("CuteDSL v2", layernorm_cutedsl_v2)]:
+            res = benchmark_func(fn, X, W, b)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
     # ---- fused benchmark ----

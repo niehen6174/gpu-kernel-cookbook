@@ -100,6 +100,13 @@ def test_correctness():
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
 
+        try:
+            from operators.rms_norm.cute.kernel import rms_norm_cutedsl_v1, rms_norm_cutedsl_v2
+            check_correctness(rms_norm_cutedsl_v1(x, w, eps), ref, name=f"CuteDSL v1 ({B}x{N})", atol=1e-5)
+            check_correctness(rms_norm_cutedsl_v2(x, w, eps), ref, name=f"CuteDSL v2 ({B}x{N})", atol=1e-5)
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
+
     print()
     print("  Fused Add + RMSNorm")
     print()
@@ -177,6 +184,15 @@ def run_benchmark(B=4096, N=4096):
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.rms_norm.cute.kernel import rms_norm_cutedsl_v1, rms_norm_cutedsl_v2
+        for label, fn in [("CuteDSL v1", rms_norm_cutedsl_v1), ("CuteDSL v2", rms_norm_cutedsl_v2)]:
+            res = benchmark_func(fn, x, w, eps)
+            bw = compute_bandwidth(bytes_rn, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
     # ---- fused benchmark ----
