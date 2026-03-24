@@ -98,6 +98,18 @@ def test_correctness():
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
 
+        # CuteDSL
+        try:
+            from operators.rope.cute.kernel import rope_cutedsl_v1, rope_cutedsl_v2
+            dq, dk = rope_cutedsl_v1(q, k, cos_cache, sin_cache, positions)
+            check_correctness(dq, ref_q, name=f"CuteDSL v1 Q ({seq_len})", atol=1e-5)
+            check_correctness(dk, ref_k, name=f"CuteDSL v1 K ({seq_len})", atol=1e-5)
+            dq, dk = rope_cutedsl_v2(q, k, cos_cache, sin_cache, positions)
+            check_correctness(dq, ref_q, name=f"CuteDSL v2 Q ({seq_len})", atol=1e-5)
+            check_correctness(dk, ref_k, name=f"CuteDSL v2 K ({seq_len})", atol=1e-5)
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
+
     print()
 
 
@@ -144,6 +156,15 @@ def run_benchmark(seq_len=4096, num_heads=32, head_dim=64):
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.rope.cute.kernel import rope_cutedsl_v1, rope_cutedsl_v2
+        for label, fn in [("CuteDSL v1", rope_cutedsl_v1), ("CuteDSL v2", rope_cutedsl_v2)]:
+            res = benchmark_func(fn, q, k, cos_cache, sin_cache, positions)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
