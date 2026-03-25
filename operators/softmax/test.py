@@ -61,6 +61,13 @@ def test_correctness():
             check_correctness(softmax_cutlass_v2(X), ref, name=f"CuTe v2 ({B}x{N})")
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
+
+        try:
+            from operators.softmax.cute.kernel import softmax_cutedsl_v1, softmax_cutedsl_v2
+            check_correctness(softmax_cutedsl_v1(X), ref, name=f"CuteDSL v1 ({B}x{N})")
+            check_correctness(softmax_cutedsl_v2(X), ref, name=f"CuteDSL v2 ({B}x{N})")
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
@@ -99,6 +106,15 @@ def run_benchmark(B=4096, N=2048):
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.softmax.cute.kernel import softmax_cutedsl_v1, softmax_cutedsl_v2
+        for label, fn in [("CuteDSL v1", softmax_cutedsl_v1), ("CuteDSL v2", softmax_cutedsl_v2)]:
+            res = benchmark_func(fn, X)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
