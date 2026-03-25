@@ -47,6 +47,14 @@ def test_correctness():
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
 
+        # CuteDSL Flash Attention
+        try:
+            from operators.attention.cute.kernel import flash_attention_cutedsl_v1, flash_attention_cutedsl_v2
+            check_correctness(flash_attention_cutedsl_v1(Q, K, V), ref, name=f"CuteDSL v1 ({N}x{D})", atol=5e-3)
+            check_correctness(flash_attention_cutedsl_v2(Q, K, V), ref, name=f"CuteDSL v2 ({N}x{D})", atol=5e-3)
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
+
     # Causal attention test
     print("\n  Causal attention test:")
     Q = torch.randn(2, 4, 256, 64, device="cuda")
@@ -104,6 +112,16 @@ def run_benchmark(B=4, H=8, N=1024, D=64):
             print(f"{label:<16}: {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.attention.cute.kernel import flash_attention_cutedsl_v1, flash_attention_cutedsl_v2
+        for label, fn in [("CuteDSL v1", flash_attention_cutedsl_v1),
+                          ("CuteDSL v2", flash_attention_cutedsl_v2)]:
+            res = benchmark_func(fn, Q, K, V)
+            tflops = compute_tflops(flops, res["mean_ms"])
+            print(f"{label:<16}: {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
 
     print()
 
