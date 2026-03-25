@@ -62,6 +62,13 @@ def test_correctness():
             check_correctness(transpose_cutlass_v2(A), ref, name=f"CuTe v2 ({M}x{N})")
         except RuntimeError as e:
             print(f"  [SKIP] CuTe: {e}")
+
+        try:
+            from operators.transpose.cute.kernel import transpose_cutedsl_v1, transpose_cutedsl_v2
+            check_correctness(transpose_cutedsl_v1(A), ref, name=f"CuteDSL v1 ({M}x{N})")
+            check_correctness(transpose_cutedsl_v2(A), ref, name=f"CuteDSL v2 ({M}x{N})")
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
@@ -100,6 +107,15 @@ def run_benchmark(M=4096, N=4096):
             print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CuTe: {e}")
+
+    try:
+        from operators.transpose.cute.kernel import transpose_cutedsl_v1, transpose_cutedsl_v2
+        for label, fn in [("CuteDSL v1", transpose_cutedsl_v1), ("CuteDSL v2", transpose_cutedsl_v2)]:
+            res = benchmark_func(fn, A)
+            bw = compute_bandwidth(bytes_accessed, res["mean_ms"])
+            print(f"{label:10s}: {res['mean_ms']:.4f} ms  BW={bw:.1f} GB/s  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 

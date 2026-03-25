@@ -75,6 +75,13 @@ def test_correctness():
             check_correctness(matmul_cutlass_hl_v2(A, B), ref, name=f"CUTLASS HL v2 ({M}x{K}x{N})", atol=1.0, rtol=1e-2)
         except RuntimeError as e:
             print(f"  [SKIP] CUTLASS HL: {e}")
+
+        try:
+            from operators.matmul.cute.kernel import matmul_cutedsl_v1, matmul_cutedsl_v2
+            check_correctness(matmul_cutedsl_v1(A, B), ref, name=f"CuteDSL v1 ({M}x{K}x{N})", atol=1e-3)
+            check_correctness(matmul_cutedsl_v2(A, B), ref, name=f"CuteDSL v2 ({M}x{K}x{N})", atol=1e-3)
+        except ImportError:
+            print("  [SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
@@ -122,6 +129,15 @@ def run_benchmark(M=4096, K=4096, N=4096):
             print(f"{label:14s}  : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
     except RuntimeError as e:
         print(f"[SKIP] CUTLASS HL: {e}")
+
+    try:
+        from operators.matmul.cute.kernel import matmul_cutedsl_v1, matmul_cutedsl_v2
+        for label, fn in [("CuteDSL v1", matmul_cutedsl_v1), ("CuteDSL v2", matmul_cutedsl_v2)]:
+            res = benchmark_func(fn, A, B)
+            tflops = compute_tflops(flops, res["mean_ms"])
+            print(f"{label:10s}      : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+    except ImportError:
+        print("[SKIP] CuteDSL (cutlass Python package not installed)")
     print()
 
 
