@@ -9,7 +9,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 echo "Building all CUDA kernels for arch=${CUDA_ARCH}..."
 echo ""
 
-for op in vector_add transpose softmax layernorm matmul attention rms_norm rope; do
+for op in vector_add transpose softmax layernorm matmul attention rms_norm rope group_gemm; do
     build_sh="$ROOT/operators/$op/cuda/build.sh"
     if [ -f "$build_sh" ]; then
         echo "Building $op..."
