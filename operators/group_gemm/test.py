@@ -72,6 +72,14 @@ def test_correctness():
             print(f"  [SKIP] CuTe: {e}")
 
         try:
+            from operators.group_gemm.cutlass.wrapper_grouped import group_gemm_cutlass_hl_v1, group_gemm_cutlass_hl_v2
+            # CUTLASS 3.x uses TF32 accumulation on Hopper → ~1e-2 vs FP32 ref
+            check_correctness(group_gemm_cutlass_hl_v1(A, B), ref, name=f"CUTLASS HL v1 ({G}x{M}x{K}x{N})", atol=0.1)
+            check_correctness(group_gemm_cutlass_hl_v2(A, B), ref, name=f"CUTLASS HL v2 ({G}x{M}x{K}x{N})", atol=0.1)
+        except RuntimeError as e:
+            print(f"  [SKIP] CUTLASS HL: {e}")
+
+        try:
             from operators.group_gemm.cute.kernel import group_gemm_cutedsl_v1, group_gemm_cutedsl_v2
             check_correctness(group_gemm_cutedsl_v1(A, B), ref, name=f"CuteDSL v1 ({G}x{M}x{K}x{N})", atol=1e-3)
             check_correctness(group_gemm_cutedsl_v2(A, B), ref, name=f"CuteDSL v2 ({G}x{M}x{K}x{N})", atol=1e-3)
@@ -125,6 +133,15 @@ def run_benchmark(G=16, M=1024, K=1024, N=1024):
             print(f"{label:16s} : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
     except ImportError:
         print("[SKIP] CuteDSL (cutlass Python package not installed)")
+
+    try:
+        from operators.group_gemm.cutlass.wrapper_grouped import group_gemm_cutlass_hl_v1, group_gemm_cutlass_hl_v2
+        for label, fn in [("CUTLASS HL v1", group_gemm_cutlass_hl_v1), ("CUTLASS HL v2", group_gemm_cutlass_hl_v2)]:
+            res = benchmark_func(fn, A, B)
+            tflops = compute_tflops(flops, res["mean_ms"])
+            print(f"{label:16s} : {res['mean_ms']:.4f} ms  {tflops:.2f} TFLOPS  {baseline/res['mean_ms']:.2f}x")
+    except RuntimeError as e:
+        print(f"[SKIP] CUTLASS HL: {e}")
     print()
 
 
