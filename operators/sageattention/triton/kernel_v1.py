@@ -115,157 +115,8 @@ def quant_per_block_int8(x: torch.Tensor, BLK: int, sm_scale: float = 1.0,
 
 
 # ============================================================
-# Flash Attention 内层循环（INT8 QK，FP16 PV，FP32 acc）
-# ============================================================
-@triton.jit
-def _sage_attn_v1_inner(
-    acc, l_i, m_i,
-    q_int8, q_scale,          # 当前 Q block (INT8)
-    K_ptr, K_scale_ptr,       # K 的 INT8 指针和 scale 指针
-    V_ptr,                    # V 的 FP16 指针
-    stride_kn, stride_vn,     # K/V 的 token stride
-    kv_len,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    start_m: tl.constexpr,    # 当前 Q block 的 tile 索引（用于 causal）
-    offs_m,                   # [BLOCK_M] Q tile 的 token 偏移
-    offs_n,                   # [BLOCK_N] K tile 的 token 偏移（从 0 开始，循环外加 start_n）
-):
-    lo = 0
-    hi = (start_m + 1) * BLOCK_M if CAUSAL else kv_len
-
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        kv_offs = start_n + offs_n  # [BLOCK_N]
-
-        # 加载 K block (INT8) 并反量化 → float 用于 dot
-        k_mask = kv_offs[None, :] < kv_len
-        k_int8 = tl.load(K_ptr + kv_offs[None, :] * stride_kn,
-                         mask=k_mask, other=0)   # [HEAD_DIM, BLOCK_N] (K is transposed)
-        k_scale = tl.load(K_scale_ptr + start_n // BLOCK_N)
-
-        # INT8 点积 → FP32（Triton tl.dot with int8 inputs outputs int32/fp32）
-        # qk: [BLOCK_M, BLOCK_N] = q_int8 [BM, D] @ k_int8^T [D, BN]
-        qk = tl.dot(q_int8, k_int8).to(tl.float32) * (q_scale * k_scale)
-
-        # Causal mask
-        if CAUSAL:
-            qk = tl.where(offs_m[:, None] >= kv_offs[None, :], qk, float("-inf"))
-
-        # 边界 mask
-        qk = tl.where(kv_offs[None, :] < kv_len, qk, float("-inf"))
-
-        # Online softmax（用 log2/exp2 代替 ln/exp，更快）
-        m_ij  = tl.maximum(m_i, tl.max(qk, axis=1))
-        qk    = qk - m_ij[:, None]
-        p     = tl.math.exp2(qk)              # [BM, BN]
-        l_ij  = tl.sum(p, axis=1)
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i   = l_i * alpha + l_ij
-        acc   = acc * alpha[:, None]
-        m_i   = m_ij
-
-        # PV 乘积：P (fp16) @ V (fp16) → 加到 fp32 acc
-        p_fp16 = p.to(tl.float16)
-        v = tl.load(V_ptr + kv_offs[:, None] * stride_vn,
-                    mask=kv_offs[:, None] < kv_len, other=0.0)  # [BN, HD]
-        # tl.dot: [BM, BN] x [BN, HD] → fp32 accumulation
-        acc += tl.dot(p_fp16, v, out_dtype=tl.float32)
-
-    return acc, l_i, m_i
-
-
-# ============================================================
 # 主注意力内核
-# ============================================================
-@triton.jit
-def _sage_attn_v1_fwd(
-    # INT8 Q/K 和对应 scale
-    Q_int8, Q_scale,
-    K_int8, K_scale,
-    V,                      # FP16 V
-    Out,
-    # Q strides (HND layout)
-    stride_qb, stride_qh, stride_qn,
-    # K strides
-    stride_kb, stride_kh, stride_kn,
-    # V strides
-    stride_vb, stride_vh, stride_vn,
-    # O strides
-    stride_ob, stride_oh, stride_on,
-    B, H_qo, H_kv,
-    qo_len, kv_len,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr,
-):
-    start_m = tl.program_id(0)    # Q tile 索引
-    off_h   = tl.program_id(1)    # head 索引
-    off_b   = tl.program_id(2)    # batch 索引
-
-    # GQA: Q head → KV head 映射
-    num_kv_groups = H_qo // H_kv
-    off_kv_h = off_h // num_kv_groups
-
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, HEAD_DIM)
-
-    # 加载 Q block (INT8)
-    q_base = Q_int8 + off_b * stride_qb + off_h * stride_qh
-    q_int8 = tl.load(q_base + offs_m[:, None] * stride_qn + offs_d[None, :],
-                     mask=offs_m[:, None] < qo_len, other=0)   # [BM, D]
-
-    # Q scale（已融合了 sm_scale * log2e）
-    q_scale_base = Q_scale + (off_b * H_qo + off_h) * tl.cdiv(qo_len, BLOCK_M)
-    q_scale = tl.load(q_scale_base + start_m)   # scalar
-
-    # K/V 基地址（注意使用 KV head）
-    K_base = K_int8 + off_b * stride_kb + off_kv_h * stride_kh
-    K_scale_base = K_scale + (off_b * H_kv + off_kv_h) * tl.cdiv(kv_len, BLOCK_N)
-    V_base = V + off_b * stride_vb + off_kv_h * stride_vh
-
-    # 初始化在线 softmax 状态
-    m_i  = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    l_i  = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc  = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-    # 内层循环（K 是列排布，stride_kn 是 token stride，K 已经转置用于 dot）
-    # K_int8 shape: (B, H, kv_len, D)，我们做 q[BM,D] @ k[D,BN]^T
-    # 所以需要 k[BN, D]^T = k^T[D, BN]
-    # Triton tl.dot(a, b): a [M,K], b [K,N]
-    # 这里 q_int8: [BM, D], k_int8: [D, BN] → 需要 k 以 (D, N) 格式存储
-    # 实际 K 存储为 (kv_len, D)，stride_kn=D，stride_kd=1
-    # 所以 k[D, BN] = k[BN, D]^T → 在 load 时按 (D, BN) 访问
-    acc, l_i, m_i = _sage_attn_v1_inner(
-        acc, l_i, m_i,
-        q_int8, q_scale,
-        K_base, K_scale_base,
-        V_base,
-        stride_kn, stride_vn,
-        kv_len,
-        BLOCK_M, BLOCK_N, HEAD_DIM, CAUSAL,
-        start_m, offs_m, offs_n,
-    )
-
-    # 最终归一化
-    acc = acc / l_i[:, None]
-
-    # 写回输出
-    O_base = Out + off_b * stride_ob + off_h * stride_oh
-    tl.store(O_base + offs_m[:, None] * stride_on + offs_d[None, :],
-             acc.to(tl.float16),
-             mask=offs_m[:, None] < qo_len)
-
-
-# ============================================================
-# 主循环内核（修正版 — K 以标准 row-major 布局，用 k[BN,D] 然后 dot 需要转置）
-# 注意：Triton tl.dot(a, b^T) 不支持，所以我们直接以 k^T 的形式访问：
-#   K_ptr stride_kn = stride on N dim (i.e., D)
-#   加载 k[D, BN]: offs_d[:, None] * 1 + offs_n[None, :] * stride_kn
+# K 以 row-major 布局，用转置访问方式做 QK^T
 # ============================================================
 @triton.jit
 def _sage_v1_kernel(
@@ -316,19 +167,19 @@ def _sage_v1_kernel(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
-        # 加载 K (INT8) [D, BN]（用列序列访问 = K^T）
+        # 加载 K (INT8) [D, BN]（转置访问 = K^T，用于 q[BM,D] @ k^T[D,BN]）
         k = tl.load(K_base + offs_d[:, None] * 1 + offs_n[None, :] * stride_kn,
                     mask=offs_n[None, :] < kv_len, other=0)   # [D, BN]
         k_scale = tl.load(K_scale_base + start_n // BLOCK_N)
 
-        # QK^T: [BM, D] @ [D, BN] → [BM, BN]
+        # QK^T: [BM, D] @ [D, BN] → [BM, BN]，反量化到 float
         qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
         if CAUSAL:
             qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
         qk = tl.where(offs_n[None, :] < kv_len, qk, float("-inf"))
 
-        # Online softmax (exp2 路径)
+        # Online softmax (exp2 路径，更快)
         m_ij  = tl.maximum(m_i, tl.max(qk, axis=1))
         p     = tl.math.exp2(qk - m_ij[:, None])
         l_ij  = tl.sum(p, axis=1)
@@ -337,7 +188,7 @@ def _sage_v1_kernel(
         acc   = acc * alpha[:, None]
         m_i   = m_ij
 
-        # PV: P (fp16) @ V [BN, D] → FP32
+        # PV: P (fp16) @ V [BN, D] → FP32 acc
         v = tl.load(V_base + offs_n[:, None] * stride_vn + offs_d[None, :],
                     mask=offs_n[:, None] < kv_len, other=0.0)
         acc += tl.dot(p.to(tl.float16), v, out_dtype=tl.float32)
@@ -401,11 +252,7 @@ def sageattn_v1(
     q_int8, q_scale = quant_per_block_int8(q, BLKQ, sm_scale=sm_scale * 1.44269504)
     k_int8, k_scale = quant_per_block_int8(k, BLKK, sm_scale=1.0)
 
-    # 输出张量（fp16）
     out = torch.empty_like(q)
-
-    # K 以 row-major 存储 (kv_len, D)，stride_kn = D（token stride）
-    stride_kn = k_int8.stride(2)   # = D（HND 布局）
 
     BLOCK_M = 128
     BLOCK_N = 64

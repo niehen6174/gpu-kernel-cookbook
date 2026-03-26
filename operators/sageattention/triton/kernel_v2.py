@@ -101,10 +101,10 @@ def quant_q_per_warp_int8(q: torch.Tensor, sm_scale: float,
 
 
 # ============================================================
-# K Per-block INT8（与 V1 相同，复用）
+# K Per-block INT8
 # ============================================================
 @triton.jit
-def _quant_per_block_int8(
+def _quant_k_per_block_int8(
     X_ptr, O_ptr, Scale_ptr,
     stride_xb, stride_xh, stride_xn,
     stride_ob, stride_oh, stride_on,
@@ -139,7 +139,7 @@ def quant_k_per_block_int8(k: torch.Tensor, BLKK: int = 64) -> tuple:
     nblocks = triton.cdiv(seq, BLKK)
     k_scale = torch.empty((B, H, nblocks), dtype=torch.float32, device=k.device)
 
-    _quant_per_block_int8[(nblocks, H, B)](
+    _quant_k_per_block_int8[(nblocks, H, B)](
         k, k_int8, k_scale,
         k.stride(0), k.stride(1), k.stride(2),
         k_int8.stride(0), k_int8.stride(1), k_int8.stride(2),
@@ -176,7 +176,7 @@ def quant_v_per_channel_fp8(v: torch.Tensor, smooth_v: bool = True):
         v_smooth = v.half()
 
     # Per-channel scale: max(|v_smooth|) / 448 along seq dim
-    v_max = v_smooth.float().abs().amax(dim=2)     # (B, H, D)
+    v_max   = v_smooth.float().abs().amax(dim=2)   # (B, H, D)
     v_scale = v_max / 448.0 + 1e-7                 # (B, H, D)
 
     v_fp8 = (v_smooth.float() / v_scale.unsqueeze(2)).clamp(-448, 448)
@@ -194,7 +194,7 @@ def _sage_v2_kernel(
     Q_int8, Q_scale,    # Q INT8 + per-warp scale (B,H,nwarps_total)
     K_int8, K_scale,    # K INT8 + per-block scale (B,H,nblocks_k)
     V_fp8, V_scale,     # V FP8  + per-channel scale (B,H,D)
-    V_mean,             # V 均值 (B,H,D)，可为 None（通过 HAS_VM 控制）
+    V_mean,             # V 均值 (B,H,D)，通过 HAS_VM 控制是否使用
     Out,
     stride_qb, stride_qh, stride_qn,
     stride_kb, stride_kh, stride_kn,
@@ -225,15 +225,12 @@ def _sage_v2_kernel(
                 mask=offs_m[:, None] < qo_len, other=0)
 
     # Q per-warp scale：每 WARPQ 行一个 scale
-    # scale shape: (nwarps_total,)，其中 nwarps_total = cdiv(qo_len, WARPQ)
-    # start_m * (BLOCK_M//WARPQ) + warp_within_block
     warp_per_block = BLOCK_M // WARPQ
     q_scale_base = Q_scale + (off_b * H_qo + off_h) * tl.cdiv(qo_len, WARPQ)
 
-    # K/V 基址
-    K_base = K_int8 + off_b * stride_kb + off_kv_h * stride_kh
+    K_base       = K_int8 + off_b * stride_kb + off_kv_h * stride_kh
     K_scale_base = K_scale + (off_b * H_kv + off_kv_h) * tl.cdiv(kv_len, BLOCK_N)
-    V_base = V_fp8  + off_b * stride_vb + off_kv_h * stride_vh
+    V_base       = V_fp8  + off_b * stride_vb + off_kv_h * stride_vh
     V_scale_base = V_scale + (off_b * H_kv + off_kv_h) * HEAD_DIM
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
@@ -246,25 +243,19 @@ def _sage_v2_kernel(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n  = start_n + tl.arange(0, BLOCK_N)
 
-        # 加载 K (INT8) 为 [HEAD_DIM, BLOCK_N]（转置访问）
+        # 加载 K (INT8) [HEAD_DIM, BLOCK_N]（转置访问）
         k = tl.load(K_base + offs_d[:, None] * 1 + offs_n[None, :] * stride_kn,
                     mask=offs_n[None, :] < kv_len, other=0)   # [D, BN]
         k_scale = tl.load(K_scale_base + start_n // BLOCK_N)
 
-        # QK: [BM, D] @ [D, BN] → [BM, BN]
-        # 使用 per-warp Q scale：对 BLOCK_M 内的每个 WARPQ 行乘不同 scale
-        # 简化：使用 Q 的 per-block scale（取 BLOCK_M 内的均值 scale）
-        # 完整 per-warp 实现需要分段乘 scale，这里使用一个近似：
-        # 对每个 warp block 内的行乘对应 scale，然后加权求和
-        # 由于 Triton 不支持向量化的 scale apply，我们使用循环（编译时展开）
-        qk_raw = tl.dot(q, k).to(tl.float32)  # [BM, BN], INT32
+        # QK: [BM, D] @ [D, BN] → [BM, BN]，使用 per-warp Q scale
+        qk_raw = tl.dot(q, k).to(tl.float32)  # INT32 dot result
 
-        # Apply per-warp Q scale（每 WARPQ 行对应一个 scale）
-        # 构造 scale 向量 [BLOCK_M, 1]
-        warp_idx = tl.arange(0, BLOCK_M) // WARPQ   # [BM]，每行所属 warp
+        # per-warp Q scale：每 WARPQ 行一个 scale
+        warp_idx     = tl.arange(0, BLOCK_M) // WARPQ
         q_scales_vec = tl.load(q_scale_base + start_m * warp_per_block + warp_idx,
-                               mask=offs_m < qo_len, other=1.0)  # [BM]
-        qk = qk_raw * q_scales_vec[:, None] * k_scale   # [BM, BN]
+                               mask=offs_m < qo_len, other=1.0)
+        qk = qk_raw * q_scales_vec[:, None] * k_scale
 
         if CAUSAL:
             qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
@@ -279,29 +270,23 @@ def _sage_v2_kernel(
         acc   = acc * alpha[:, None]
         m_i   = m_ij
 
-        # 加载 V (FP8) [BN, D]
+        # 加载 V (FP8) [BN, D]，上转为 fp16 参与 dot
         v_fp8 = tl.load(V_base + offs_n[:, None] * stride_vn + offs_d[None, :],
-                        mask=offs_n[:, None] < kv_len, other=0.0)  # [BN, D]
-
-        # PV: P [BM, BN] @ V [BN, D] → [BM, D]
-        # FP8 V 在 dot 中会自动上转为 fp32
+                        mask=offs_n[:, None] < kv_len, other=0.0)
         acc += tl.dot(p.to(tl.float16), v_fp8.to(tl.float16), out_dtype=tl.float32)
 
     # 归一化
     acc = acc / l_i[:, None]
 
-    # V scale dequantize：每个 head_dim 位置乘以对应 scale
+    # V scale dequantize（per-channel）
     v_scales = tl.load(V_scale_base + offs_d)   # [D]
     acc = acc * v_scales[None, :]
 
-    # V mean 恢复：out += l_i_norm_sum * vm
-    # 由于 acc 已经归一化（除以 l_i），而 softmax 权重 sum = 1
-    # 只需 acc += vm（均值向量，相当于 sum_j p_j * vm = vm）
+    # V mean 恢复：sum_j(p_j) = 1 after normalization → out += vm
     if HAS_VM:
-        vm = tl.load(V_mean + (off_b * H_kv + off_kv_h) * HEAD_DIM + offs_d)  # [D]
+        vm = tl.load(V_mean + (off_b * H_kv + off_kv_h) * HEAD_DIM + offs_d)
         acc = acc + vm[None, :]
 
-    # 写回
     O_base = Out + off_b * stride_ob + off_h * stride_oh
     tl.store(O_base + offs_m[:, None] * stride_on + offs_d[None, :],
              acc.to(Out.type.element_ty),
@@ -352,16 +337,16 @@ def sageattn_v2(
 
     # Q per-warp INT8 量化
     BLKQ, WARPQ = 128, 16
-    q_int8, q_scale = quant_q_per_warp_int8(q, sm_scale=sm_scale * 1.44269504,
-                                             BLKQ=BLKQ, WARPQ=WARPQ)
+    q_int8, q_scale = quant_q_per_warp_int8(
+        q, sm_scale=sm_scale * 1.44269504, BLKQ=BLKQ, WARPQ=WARPQ)
 
     # K per-block INT8 量化
     BLKK = 64
     k_int8, k_scale = quant_k_per_block_int8(k, BLKK)
 
-    # V mean 指针（若有）
+    # V mean（若有 smoothing）
     if smooth_v and vm is not None:
-        vm_flat = vm.squeeze(2).contiguous()   # (B, H_kv, D)
+        vm_flat = vm.squeeze(2).float().contiguous()   # (B, H_kv, D)
     else:
         vm_flat = torch.zeros(B, H_kv, D, dtype=torch.float32, device=q.device)
 

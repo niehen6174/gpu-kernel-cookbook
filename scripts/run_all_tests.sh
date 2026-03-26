@@ -9,7 +9,7 @@ cd "$ROOT"
 echo "Running all operator tests..."
 echo ""
 
-for op in vector_add transpose softmax layernorm matmul attention rms_norm rope group_gemm; do
+for op in vector_add transpose softmax layernorm matmul attention rms_norm rope group_gemm sageattention; do
     test_py="$ROOT/operators/$op/test.py"
     if [ -f "$test_py" ]; then
         echo "========================================"

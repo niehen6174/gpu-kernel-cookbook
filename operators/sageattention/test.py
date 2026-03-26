@@ -9,19 +9,19 @@ SageAttention vs FlashAttention 对比测试
 
 运行：
     cd gpu-kernel-lab
-    python -m operators.attention.test_sage
+    python -m operators.sageattention.test
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 import torch
 import math
 
 from common.check import check_correctness
 from common.utils import benchmark_func, compute_tflops, get_gpu_info
-from operators.attention.sage.kernel_v1 import sageattn_v1
-from operators.attention.sage.kernel_v2 import sageattn_v2
+from operators.sageattention.triton.kernel_v1 import sageattn_v1
+from operators.sageattention.triton.kernel_v2 import sageattn_v2
 
 
 # ============================================================
@@ -39,7 +39,7 @@ def attention_ref_fp16(q, k, v, is_causal=False, sm_scale=None):
     if is_causal:
         mask = torch.tril(torch.ones(N, N, device=q.device)).bool()
         qk = qk.masked_fill(~mask, float("-inf"))
-    attn = torch.softmax(qk, dim=-1)   # float32
+    attn = torch.softmax(qk, dim=-1)
     return torch.matmul(attn, v.float()).to(torch.float16)
 
 
@@ -62,12 +62,11 @@ def flash_attn_v2(q, k, v, is_causal=False, sm_scale=None):
     """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
-    # (B, H, N, D) → (B, N, H, D)
     q_ = q.transpose(1, 2).contiguous()
     k_ = k.transpose(1, 2).contiguous()
     v_ = v.transpose(1, 2).contiguous()
     out = flash_attn_func(q_, k_, v_, softmax_scale=sm_scale, causal=is_causal)
-    return out.transpose(1, 2).contiguous()   # → (B, H, N, D)
+    return out.transpose(1, 2).contiguous()
 
 
 # ============================================================
@@ -95,11 +94,10 @@ def test_correctness():
     print("=" * 70)
 
     test_shapes = [
-        # (B, H, N, D)
-        (1, 8, 512, 64),
-        (2, 8, 1024, 64),
+        (1, 8,  512,  64),
+        (2, 8, 1024,  64),
         (1, 16, 2048, 64),
-        (1, 8, 512, 128),
+        (1, 8,  512, 128),
         (2, 8, 1024, 128),
     ]
 
@@ -111,49 +109,36 @@ def test_correctness():
 
         ref = attention_ref_fp16(q, k, v)
 
-        # ---- SageAttention v1 (ours) ----
-        out_v1 = sageattn_v1(q, k, v, smooth_k=True)
-        # SageAttention 是近似算法，允许更大误差（INT8量化误差）
-        # 典型 cosine sim > 0.999，相对误差 ~1%
-        check_correctness(out_v1, ref,
-                          name=f"SageAttn v1 (ours, smooth_k) N={N} D={D}",
-                          atol=0.05, rtol=0.02)
+        # SageAttention v1 (ours) — INT8 QK，近似算法，atol=0.05
+        check_correctness(sageattn_v1(q, k, v, smooth_k=True), ref,
+                          name=f"SageAttn v1 (smooth_k) N={N} D={D}", atol=0.05, rtol=0.02)
+        check_correctness(sageattn_v1(q, k, v, smooth_k=False), ref,
+                          name=f"SageAttn v1 (no smooth) N={N} D={D}", atol=0.05, rtol=0.02)
 
-        out_v1_ns = sageattn_v1(q, k, v, smooth_k=False)
-        check_correctness(out_v1_ns, ref,
-                          name=f"SageAttn v1 (ours, no_smooth) N={N} D={D}",
-                          atol=0.05, rtol=0.02)
+        # SageAttention v2 (ours) — INT8 QK + FP8 V
+        check_correctness(sageattn_v2(q, k, v, smooth_k=True, smooth_v=True), ref,
+                          name=f"SageAttn v2 (smooth_kv) N={N} D={D}", atol=0.05, rtol=0.02)
 
-        # ---- SageAttention v2 (ours) ----
-        out_v2 = sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)
-        check_correctness(out_v2, ref,
-                          name=f"SageAttn v2 (ours, smooth_kv) N={N} D={D}",
-                          atol=0.05, rtol=0.02)
-
-        # ---- FlashAttention v2 ----
+        # FlashAttention v2（精确，atol=5e-3）
         if HAS_FA2:
-            out_fa2 = flash_attn_v2(q, k, v)
-            check_correctness(out_fa2, ref,
-                              name=f"FlashAttn v2 N={N} D={D}",
-                              atol=5e-3, rtol=1e-3)
+            check_correctness(flash_attn_v2(q, k, v), ref,
+                              name=f"FlashAttn v2 N={N} D={D}", atol=5e-3, rtol=1e-3)
 
-        # ---- 官方 SageAttention（若有）----
+        # 官方 SageAttention
         if HAS_SAGE_PKG:
-            out_sage = sage_official(q, k, v)
-            check_correctness(out_sage, ref,
-                              name=f"SageAttn official N={N} D={D}",
-                              atol=0.05, rtol=0.02)
+            check_correctness(sage_official(q, k, v), ref,
+                              name=f"SageAttn official N={N} D={D}", atol=0.05, rtol=0.02)
 
     # 因果注意力测试
-    print("\n  [Causal Attention] B=1, H=8, N=1024, D=64")
+    print("\n  [Causal Attention] B=1 H=8 N=1024 D=64")
     q = torch.randn(1, 8, 1024, 64, device="cuda", dtype=torch.float16)
     k = torch.randn(1, 8, 1024, 64, device="cuda", dtype=torch.float16)
     v = torch.randn(1, 8, 1024, 64, device="cuda", dtype=torch.float16)
     ref_causal = attention_ref_fp16(q, k, v, is_causal=True)
+
     check_correctness(sageattn_v1(q, k, v, is_causal=True), ref_causal,
                       name="SageAttn v1 causal", atol=0.05)
-    # V2 causal：FP8 V 量化使用全局均值做 smoothing，在因果遮蔽下（早期 token 仅能 attend 少量位置）
-    # 误差略高，使用更宽松的容差（~0.12 为已知数值精度上限）
+    # V2 causal：FP8 V 全局均值 smoothing 在因果遮蔽下误差略高
     check_correctness(sageattn_v2(q, k, v, is_causal=True), ref_causal,
                       name="SageAttn v2 causal", atol=0.15)
     if HAS_FA2:
@@ -163,7 +148,7 @@ def test_correctness():
 
 
 # ============================================================
-# 量化误差分析（对比有/无 smoothing 的效果）
+# K/V Smoothing 效果分析
 # ============================================================
 def test_smoothing_effect():
     print("=" * 70)
@@ -176,20 +161,12 @@ def test_smoothing_effect():
     v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
     ref = attention_ref_fp16(q, k, v)
 
-    # 无 smoothing
-    out_no_smooth  = sageattn_v1(q, k, v, smooth_k=False)
-    # 有 K smoothing
-    out_k_smooth   = sageattn_v1(q, k, v, smooth_k=True)
-    # V2 K+V smoothing
-    out_v2_smooth  = sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)
-    out_v2_no_sv   = sageattn_v2(q, k, v, smooth_k=True, smooth_v=False)
-
     def cosine_sim(a, b):
         a_ = a.float().flatten()
         b_ = b.float().flatten()
         return (a_ * b_).sum() / (a_.norm() * b_.norm())
 
-    def mean_abs_err(a, b):
+    def mae(a, b):
         return (a.float() - b.float()).abs().mean().item()
 
     print(f"\n  Shape: B={B} H={H} N={N} D={D}")
@@ -197,26 +174,49 @@ def test_smoothing_effect():
     print(f"  {'-'*52}")
 
     for name, out in [
-        ("v1 无 smoothing",      out_no_smooth),
-        ("v1 K smoothing",       out_k_smooth),
-        ("v2 K+V smoothing",     out_v2_smooth),
-        ("v2 K smooth, no V sm", out_v2_no_sv),
+        ("v1 无 smoothing",      sageattn_v1(q, k, v, smooth_k=False)),
+        ("v1 K smoothing",       sageattn_v1(q, k, v, smooth_k=True)),
+        ("v2 K+V smoothing",     sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)),
+        ("v2 K smooth only",     sageattn_v2(q, k, v, smooth_k=True, smooth_v=False)),
     ]:
-        mae = mean_abs_err(out, ref)
-        cos = cosine_sim(out, ref).item()
-        print(f"  {name:<30} {mae:>10.4f} {cos:>10.6f}")
+        print(f"  {name:<30} {mae(out, ref):>10.4f} {cosine_sim(out, ref).item():>10.6f}")
+    print()
+
+
+# ============================================================
+# 量化误差 vs 序列长度
+# ============================================================
+def run_error_scaling():
+    print("=" * 70)
+    print("量化误差 vs 序列长度（MAE / cos_sim 相对于 FP16 参考值）")
+    print("=" * 70)
+    print(f"  {'N':>6}  {'Sage v1 MAE':>14}  {'Sage v2 MAE':>14}  "
+          f"{'Sage v1 cos':>12}  {'Sage v2 cos':>12}")
+    print(f"  {'-'*65}")
+
+    B, H, D = 1, 8, 64
+    for N in [512, 1024, 2048, 4096, 8192]:
+        q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        ref = attention_ref_fp16(q, k, v)
+        o1  = sageattn_v1(q, k, v, smooth_k=True)
+        o2  = sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)
+
+        def mae(a, b): return (a.float() - b.float()).abs().mean().item()
+        def cos(a, b):
+            a_ = a.float().flatten(); b_ = b.float().flatten()
+            return ((a_ * b_).sum() / (a_.norm() * b_.norm())).item()
+
+        print(f"  {N:>6}  {mae(o1,ref):>14.5f}  {mae(o2,ref):>14.5f}  "
+              f"{cos(o1,ref):>12.6f}  {cos(o2,ref):>12.6f}")
     print()
 
 
 # ============================================================
 # 长序列 Benchmark：SageAttention vs FlashAttention
 # ============================================================
-def run_long_seq_benchmark(
-    B: int = 1,
-    H: int = 16,
-    D: int = 64,
-    seq_lens: list = None,
-):
+def run_long_seq_benchmark(B=1, H=16, D=64, seq_lens=None):
     if seq_lens is None:
         seq_lens = [1024, 2048, 4096, 8192, 16384]
 
@@ -226,11 +226,11 @@ def run_long_seq_benchmark(
     print(get_gpu_info())
     print()
 
-    header = f"{'N':>6}  {'FA2':>12}  {'Sage v1 (ours)':>16}  {'Sage v2 (ours)':>16}"
+    header = f"{'N':>6}  {'FA2':>16}  {'Sage v1 (ours)':>20}  {'Sage v2 (ours)':>20}"
     if HAS_SAGE_PKG:
-        header += f"  {'Sage official':>14}"
+        header += f"  {'Sage official':>18}"
     print(header)
-    print("-" * 80)
+    print("-" * 85)
 
     for N in seq_lens:
         q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
@@ -238,52 +238,43 @@ def run_long_seq_benchmark(
         v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
         flops = 4 * B * H * N * N * D
 
-        # FlashAttention v2
         if HAS_FA2:
-            r_fa2 = benchmark_func(flash_attn_v2, q, k, v)
-            t_fa2 = r_fa2["mean_ms"]
-            tf_fa2 = compute_tflops(flops, t_fa2)
-            fa2_str = f"{t_fa2:.3f}ms({tf_fa2:.1f}T)"
+            r = benchmark_func(flash_attn_v2, q, k, v)
+            t_fa2 = r["mean_ms"]
+            fa2_str = f"{t_fa2:.3f}ms ({compute_tflops(flops, t_fa2):.1f}T)"
         else:
             t_fa2 = None
             fa2_str = "N/A"
 
-        # SageAttention v1 (ours)
-        r_s1 = benchmark_func(sageattn_v1, q, k, v)
-        t_s1 = r_s1["mean_ms"]
-        tf_s1 = compute_tflops(flops, t_s1)
-        sp1 = f"({t_fa2/t_s1:.2f}x)" if t_fa2 else ""
-        s1_str = f"{t_s1:.3f}ms({tf_s1:.1f}T){sp1}"
+        r1 = benchmark_func(sageattn_v1, q, k, v)
+        t1 = r1["mean_ms"]
+        sp1 = f"{t_fa2/t1:.2f}x" if t_fa2 else ""
+        s1_str = f"{t1:.3f}ms ({compute_tflops(flops, t1):.1f}T) {sp1}"
 
-        # SageAttention v2 (ours)
-        r_s2 = benchmark_func(sageattn_v2, q, k, v)
-        t_s2 = r_s2["mean_ms"]
-        tf_s2 = compute_tflops(flops, t_s2)
-        sp2 = f"({t_fa2/t_s2:.2f}x)" if t_fa2 else ""
-        s2_str = f"{t_s2:.3f}ms({tf_s2:.1f}T){sp2}"
+        r2 = benchmark_func(sageattn_v2, q, k, v)
+        t2 = r2["mean_ms"]
+        sp2 = f"{t_fa2/t2:.2f}x" if t_fa2 else ""
+        s2_str = f"{t2:.3f}ms ({compute_tflops(flops, t2):.1f}T) {sp2}"
 
-        line = f"{N:>6}  {fa2_str:>12}  {s1_str:>16}  {s2_str:>16}"
+        line = f"{N:>6}  {fa2_str:>16}  {s1_str:>20}  {s2_str:>20}"
 
-        # 官方 SageAttention
         if HAS_SAGE_PKG:
-            r_so = benchmark_func(sage_official, q, k, v)
-            t_so = r_so["mean_ms"]
-            tf_so = compute_tflops(flops, t_so)
-            sp_o = f"({t_fa2/t_so:.2f}x)" if t_fa2 else ""
-            line += f"  {t_so:.3f}ms({tf_so:.1f}T){sp_o:>8}"
+            ro = benchmark_func(sage_official, q, k, v)
+            t_o = ro["mean_ms"]
+            sp_o = f"{t_fa2/t_o:.2f}x" if t_fa2 else ""
+            line += f"  {t_o:.3f}ms ({compute_tflops(flops, t_o):.1f}T) {sp_o}"
 
         print(line)
-
     print()
 
 
 # ============================================================
-# 详细 Benchmark：固定 N，比较所有实现的 TFLOPS
+# 详细 Benchmark
 # ============================================================
 def run_detailed_benchmark(B=1, H=16, N=4096, D=64):
     print("=" * 70)
     print(f"详细 Benchmark: B={B} H={H} N={N} D={D}")
-    print("（TFLOPS 基于 4*B*H*N²*D 计算，不含量化开销）")
+    print("（TFLOPS 基于 4*B*H*N²*D，不含量化开销）")
     print("=" * 70)
 
     q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
@@ -291,54 +282,51 @@ def run_detailed_benchmark(B=1, H=16, N=4096, D=64):
     v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
     flops = 4 * B * H * N * N * D
 
-    implementations = []
-
+    impls = []
     if HAS_FA2:
-        implementations.append(("FlashAttention v2", lambda: flash_attn_v2(q, k, v)))
-
-    implementations += [
-        ("SageAttn v1 (ours, smooth)",    lambda: sageattn_v1(q, k, v, smooth_k=True)),
-        ("SageAttn v1 (ours, no smooth)", lambda: sageattn_v1(q, k, v, smooth_k=False)),
-        ("SageAttn v2 (ours, smooth_kv)", lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)),
-        ("SageAttn v2 (ours, smooth_k)",  lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=False)),
+        impls.append(("FlashAttention v2",            lambda: flash_attn_v2(q, k, v)))
+    impls += [
+        ("SageAttn v1 (smooth_k)",         lambda: sageattn_v1(q, k, v, smooth_k=True)),
+        ("SageAttn v1 (no smooth)",        lambda: sageattn_v1(q, k, v, smooth_k=False)),
+        ("SageAttn v2 (smooth_kv)",        lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)),
+        ("SageAttn v2 (smooth_k only)",    lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=False)),
     ]
-
     if HAS_SAGE_PKG:
-        implementations.append(("SageAttn official",   lambda: sage_official(q, k, v)))
+        impls.append(("SageAttn official",            lambda: sage_official(q, k, v)))
 
     print(f"\n  {'实现':<35}  {'时间(ms)':>10}  {'TFLOPS':>8}  {'vs FA2':>8}")
     print(f"  {'-'*65}")
 
-    fa2_time = None
-    for name, fn in implementations:
+    fa2_t = None
+    for name, fn in impls:
         try:
             r = benchmark_func(fn)
             t = r["mean_ms"]
             tf = compute_tflops(flops, t)
-            if fa2_time is None and "FlashAttention" in name:
-                fa2_time = t
-            speedup = f"{fa2_time/t:.2f}x" if fa2_time and name != "FlashAttention v2" else "baseline"
-            print(f"  {name:<35}  {t:>10.3f}  {tf:>8.2f}  {speedup:>8}")
+            if fa2_t is None and "FlashAttention" in name:
+                fa2_t = t
+            sp = f"{fa2_t/t:.2f}x" if fa2_t and "FlashAttention" not in name else "baseline"
+            print(f"  {name:<35}  {t:>10.3f}  {tf:>8.2f}  {sp:>8}")
         except Exception as e:
             print(f"  {name:<35}  [ERROR: {e}]")
     print()
 
-    # Causal attention
+    # Causal
     print(f"  [Causal 模式]")
     print(f"  {'实现':<35}  {'时间(ms)':>10}  {'TFLOPS':>8}")
     print(f"  {'-'*55}")
-    causal_impls = []
+    causal = []
     if HAS_FA2:
-        causal_impls.append(("FlashAttention v2 causal", lambda: flash_attn_v2(q, k, v, is_causal=True)))
-    causal_impls += [
-        ("SageAttn v1 causal", lambda: sageattn_v1(q, k, v, is_causal=True)),
-        ("SageAttn v2 causal", lambda: sageattn_v2(q, k, v, is_causal=True)),
+        causal.append(("FlashAttention v2 causal",    lambda: flash_attn_v2(q, k, v, is_causal=True)))
+    causal += [
+        ("SageAttn v1 causal",             lambda: sageattn_v1(q, k, v, is_causal=True)),
+        ("SageAttn v2 causal",             lambda: sageattn_v2(q, k, v, is_causal=True)),
     ]
-    for name, fn in causal_impls:
+    for name, fn in causal:
         try:
             r = benchmark_func(fn)
             t = r["mean_ms"]
-            tf = compute_tflops(flops // 2, t)  # causal ~half FLOPs
+            tf = compute_tflops(flops // 2, t)
             print(f"  {name:<35}  {t:>10.3f}  {tf:>8.2f}")
         except Exception as e:
             print(f"  {name:<35}  [ERROR: {e}]")
@@ -346,11 +334,11 @@ def run_detailed_benchmark(B=1, H=16, N=4096, D=64):
 
 
 # ============================================================
-# 内存效率分析
+# 内存占用分析
 # ============================================================
 def run_memory_analysis():
     print("=" * 70)
-    print("内存占用分析（不同序列长度下 peak memory，H=16 D=64）")
+    print("内存占用分析（peak memory，H=16 D=64）")
     print("=" * 70)
     print(f"  {'N':>6}  {'FA2(MB)':>10}  {'Sage v1(MB)':>12}  {'Sage v2(MB)':>12}")
     print(f"  {'-'*45}")
@@ -361,49 +349,17 @@ def run_memory_analysis():
         k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
         v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 
-        def measure_mem(fn):
+        def measure(fn):
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
             fn()
             torch.cuda.synchronize()
             return torch.cuda.max_memory_allocated() / 1024**2
 
-        mem_fa2 = measure_mem(lambda: flash_attn_v2(q, k, v)) if HAS_FA2 else float("nan")
-        mem_s1  = measure_mem(lambda: sageattn_v1(q, k, v))
-        mem_s2  = measure_mem(lambda: sageattn_v2(q, k, v))
-
+        mem_fa2 = measure(lambda: flash_attn_v2(q, k, v)) if HAS_FA2 else float("nan")
+        mem_s1  = measure(lambda: sageattn_v1(q, k, v))
+        mem_s2  = measure(lambda: sageattn_v2(q, k, v))
         print(f"  {N:>6}  {mem_fa2:>10.1f}  {mem_s1:>12.1f}  {mem_s2:>12.1f}")
-    print()
-
-
-# ============================================================
-# 误差 vs 序列长度分析（量化误差随 N 的变化）
-# ============================================================
-def run_error_scaling():
-    print("=" * 70)
-    print("量化误差 vs 序列长度（MSE 相对于 FP16 精确参考值）")
-    print("=" * 70)
-    print(f"  {'N':>6}  {'Sage v1 MAE':>14}  {'Sage v2 MAE':>14}  {'Sage v1 cos':>12}  {'Sage v2 cos':>12}")
-    print(f"  {'-'*65}")
-
-    B, H, D = 1, 8, 64
-    for N in [512, 1024, 2048, 4096, 8192]:
-        q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-        k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-        v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-
-        ref = attention_ref_fp16(q, k, v)
-        o1  = sageattn_v1(q, k, v, smooth_k=True)
-        o2  = sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)
-
-        def mae(a, b): return (a.float() - b.float()).abs().mean().item()
-        def cos(a, b):
-            a_ = a.float().flatten()
-            b_ = b.float().flatten()
-            return ((a_ * b_).sum() / (a_.norm() * b_.norm())).item()
-
-        print(f"  {N:>6}  {mae(o1,ref):>14.5f}  {mae(o2,ref):>14.5f}  "
-              f"{cos(o1,ref):>12.6f}  {cos(o2,ref):>12.6f}")
     print()
 
 
