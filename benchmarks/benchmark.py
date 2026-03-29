@@ -512,6 +512,73 @@ def benchmark_rope():
 # -------------------------------------------------------------------------
 # 打印 & 主入口
 # -------------------------------------------------------------------------
+# svdquant
+# -------------------------------------------------------------------------
+def benchmark_svdquant():
+    from operators.svdquant.pytorch.svdquant_torch import (
+        create_svdquant_params, svdquant_forward_torch
+    )
+    from operators.svdquant.pytorch.baseline import matmul_fp16_baseline
+
+    results = {}
+    for M, K, N in [(64, 512, 512), (256, 2048, 2048), (1024, 4096, 4096)]:
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.5
+        W = torch.randn(K, N, device="cuda", dtype=torch.float16) * 0.02
+        smooth = torch.rand(K, device="cuda", dtype=torch.float16) * 0.5 + 0.5
+        bias = torch.randn(N, device="cuda", dtype=torch.float16) * 0.01
+        params = create_svdquant_params(W, rank=32, group_size=64, smooth=smooth)
+
+        flops = 2 * M * (K * N + K * 32 + 32 * N)
+        key = f"M={M},K={K},N={N}"
+        results[key] = {}
+
+        impls = [
+            ("fp16_baseline",    lambda: matmul_fp16_baseline(x, W, bias)),
+            ("pytorch_svdquant", lambda: svdquant_forward_torch(
+                x, params["q_w"], params["wscales"],
+                params["lora_down"], params["lora_up"],
+                smooth, bias, group_size=64)),
+        ]
+
+        # Triton version
+        try:
+            from operators.svdquant.triton.kernel import svdquant_forward_triton
+            impls.append(("triton_svdquant", lambda: svdquant_forward_triton(
+                x, params["q_w"], params["wscales"],
+                params["lora_down"], params["lora_up"],
+                smooth, bias, group_size=64)))
+        except ImportError:
+            pass
+
+        # CuTe version
+        try:
+            from operators.svdquant.cute.kernel import svdquant_forward_cute, CUTE_AVAILABLE
+            if CUTE_AVAILABLE:
+                # warmup compile
+                svdquant_forward_cute(x, params["q_w"], params["wscales"],
+                    params["lora_down"], params["lora_up"], smooth, bias, version="v1")
+                svdquant_forward_cute(x, params["q_w"], params["wscales"],
+                    params["lora_down"], params["lora_up"], smooth, bias, version="v2")
+                impls.append(("cute_v1_svdquant", lambda: svdquant_forward_cute(
+                    x, params["q_w"], params["wscales"],
+                    params["lora_down"], params["lora_up"], smooth, bias, version="v1")))
+                impls.append(("cute_v2_svdquant", lambda: svdquant_forward_cute(
+                    x, params["q_w"], params["wscales"],
+                    params["lora_down"], params["lora_up"], smooth, bias, version="v2")))
+        except Exception:
+            pass
+
+        for name, fn in impls:
+            r = benchmark_func(fn)
+            results[key][name] = {
+                "mean_ms": r["mean_ms"],
+                "tflops": compute_tflops(flops, r["mean_ms"]),
+            }
+    return results
+
+
+# -------------------------------------------------------------------------
 BENCHMARKS = {
     "vector_add": benchmark_vector_add,
     "transpose":  benchmark_transpose,
@@ -521,6 +588,7 @@ BENCHMARKS = {
     "attention":  benchmark_attention,
     "rms_norm":   benchmark_rms_norm,
     "rope":       benchmark_rope,
+    "svdquant":   benchmark_svdquant,
 }
 
 
