@@ -1,26 +1,23 @@
 """
-SageAttention CuTe DSL 实现 (Hopper SM90a) — 优化版 v2
+SageAttention V2 CuTe DSL 实现 (Hopper SM90a)
 
-优化要点（相比 v1）:
-1. 128-bit 向量化加载 (CopyUniversalOp + cp.async)：
-   - Q/K/V 均使用 128-bit 向量化 LDG.128 / cp.async.cg 指令
-2. rs-mode PV GEMM (OperandSource.RMEM)：
-   - P 保留在寄存器，无需写回 sP smem 缓冲区
-   - 节省 ~8KB smem，减少 1 次 barrier
-3. K Double Buffering (2-stage sK smem)：
-   - K[0] 和 K[1] 在 prologue 中预取到各自的 smem stage
-   - 主循环中 K[n+2] 在 PV GEMM 期间加载，完全消除 K 等待
-4. GPU Triton 量化（替换 Python 循环）
+V2 相对 V1 的升级：
+1. Q: per-block INT8 → per-warp INT8（WARPQ=16，每个 BLOCK_M=64 含 4 个 warp scale）
+2. K: 不变（per-block INT8 + K Smoothing）
+3. V: FP16 → FP8 per-channel（round-trip dequantize 回 FP16 后传入 kernel）
+   + V Smoothing（均值在 Python epilogue 恢复）
 
-已尝试但不可行的优化:
-- BLOCK_N=128 (Option D): 需要 4 个 smem 缓冲区 (36KB vs 20KB)，无性能收益
-- FP8 PV GEMM: CuTe DSL 不支持标量 fp32→fp8 类型转换 (nvgpu.cvt_fptrunc 需要向量输入)
-- 消除 V permute: COL_MAJOR smem 的 MN_SW128 swizzle 导致 cp.async 地址不对齐
+FP8 V WGMMA 在 CuTe DSL 中不可行，故采用量化噪声模拟方案：
+V 在 Python 预处理时经 FP8 round-trip 后 dequantize 回 FP16，kernel 仍使用 FP16 PV GEMM。
+V mean 恢复在 kernel 输出后由 Python epilogue 完成。
 
-性能 (H20 SM90a, B=1 H=32 D=64):
-  N=8192: kernel=3.19ms, total=3.44ms (Triton: 3.29ms)
+Kernel 核心改动（相对 kernel.py）：
+- gQScale: (B*H*N_Q_BLOCKS,) → (B*H*N_Q_BLOCKS, WARPS_PER_BLOCK)
+- q_scale_val: gQScale[bidx] → gQScale[bidx, tidx // 32]  (per-warp)
 
-设计参考: SageAttention (arXiv:2410.02367)
+性能与 V1 相同（相同 smem 布局），量化步骤略慢（多 V FP8 round-trip）。
+
+设计参考: SageAttention V2 (arXiv:2501.01005)
 """
 
 import os
@@ -45,13 +42,13 @@ BLOCK_M      = 64    # Q tile M-dim per CTA
 BLOCK_N      = 64    # KV tile N-dim (WGMMA m64n64)
 HEAD_DIM     = 64    # head dimension (fixed)
 NUM_THREADS  = 128   # 1 warpgroup = 128 threads
+WARPQ        = 16    # Q rows per warp (V2: per-warp quantization)
+WARPS_PER_BLOCK = BLOCK_M // WARPQ   # = 4
 
 # acc_S per-thread fragment (BLOCK_M=64, BLOCK_N=64, m64n64 WGMMA INT8)
 # 128 threads × 32 elems = 64×64 total, 2 M-rows per thread
 ACC_FRAG_SIZE    = 32
 ACC_ROWS_PER_THR = 2
-
-# warp-reduce: BLOCK_N=64 → 4 threads/row → 2 steps (offset 2, 1)
 
 # flat element counts
 TILE_ELEMS_K = BLOCK_N * HEAD_DIM   # int8: 64×64 = 4096
@@ -61,53 +58,18 @@ Q_ELEMS      = BLOCK_M * HEAD_DIM   # int8: 64×64 = 4096
 LOG2_E = 1.4426950408889634
 
 # ============================================================
-# 量化（GPU Triton kernels）
+# 量化（GPU Triton kernels + V2 helpers）
 # ============================================================
-from .quant import quant_q_per_block_gpu, smooth_and_quant_k_gpu, quant_per_block_int8, quant_v_per_tile_fp8_gpu
-
-FP8_E4M3_MAX = 448.0   # max representable value of Float8E4M3FN
-
-
-# ============================================================
-# CPU 参考版（仅用于调试）
-# ============================================================
-def _smooth_and_quant_k_cpu(k: torch.Tensor, sm_scale: float) -> tuple:
-    B, H, N, D = k.shape
-    km = k.float().mean(dim=2, keepdim=True)
-    k_s = (k.float() - km).to(torch.float16)
-    nblocks_k = (N + BLOCK_N - 1) // BLOCK_N
-    k_int8  = torch.empty_like(k_s, dtype=torch.int8)
-    k_scale = torch.empty((B, H, nblocks_k), dtype=torch.float32, device=k.device)
-    for b in range(B):
-        for h in range(H):
-            for bn in range(nblocks_k):
-                s = bn * BLOCK_N; e = min(s + BLOCK_N, N)
-                blk = k_s[b, h, s:e, :].float()
-                sc  = blk.abs().max() / 127.0 + 1e-7
-                k_int8[b, h, s:e, :] = (blk / sc + 0.5 * blk.sign()).clamp(-128, 127).to(torch.int8)
-                k_scale[b, h, bn] = sc
-    return k_int8, k_scale, km.to(torch.float16)
-
-
-def _quant_q_per_block_cpu(q: torch.Tensor, sm_scale: float) -> tuple:
-    B, H, N, D = q.shape
-    nblocks_q = (N + BLOCK_M - 1) // BLOCK_M
-    q_int8  = torch.empty_like(q, dtype=torch.int8)
-    q_scale = torch.empty((B, H, nblocks_q), dtype=torch.float32, device=q.device)
-    sf = sm_scale * LOG2_E
-    for b in range(B):
-        for h_i in range(H):
-            for bm in range(nblocks_q):
-                s = bm * BLOCK_M; e = min(s + BLOCK_M, N)
-                blk = q[b, h_i, s:e, :].float() * sf
-                sc  = blk.abs().max() / 127.0 + 1e-7
-                q_int8[b, h_i, s:e, :] = (blk / sc + 0.5 * blk.sign()).clamp(-128, 127).to(torch.int8)
-                q_scale[b, h_i, bm] = sc
-    return q_int8, q_scale
+from .quant import (
+    smooth_and_quant_k_gpu,
+    quant_per_block_int8,
+    quant_q_per_warp_int8_gpu,
+    quant_v_per_channel_fp8,
+)
 
 
 # ============================================================
-# CuTe DSL Kernel (BLOCK_N=64, rs-mode PV, K double buffering)
+# CuTe DSL Kernel V2 (per-warp Q scale, FP16 V after FP8 round-trip)
 # ============================================================
 
 @cute.kernel
@@ -116,7 +78,7 @@ def _sage_kernel_v2(
     gK:      cute.Tensor,   # (B*H*N_KV_BLOCKS, BLOCK_N,  HEAD_DIM) int8
     gV:      cute.Tensor,   # (B*H*N_KV_BLOCKS, HEAD_DIM, BLOCK_N)  fp16
     gO:      cute.Tensor,   # (B*H*N_Q_BLOCKS,  BLOCK_M,  HEAD_DIM) fp32
-    gQScale: cute.Tensor,   # (B*H*N_Q_BLOCKS,) fp32
+    gQScale: cute.Tensor,   # (B*H*N_Q_BLOCKS, WARPS_PER_BLOCK) fp32  ← 2D (V2)
     gKScale: cute.Tensor,   # (B*H, N_KV_BLOCKS) fp32
     n_kv_blocks: cute.Int32,
     n_q_blocks:  cute.Int32,
@@ -211,7 +173,9 @@ def _sage_kernel_v2(
     row_max.fill(-cutlass.Float32.inf)
     row_sum.fill(cutlass.Float32(0.0))
 
-    q_scale_val = gQScale[bidx]
+    # V2: per-warp Q scale — warp index = tidx // 32
+    warp_idx = tidx // 32
+    q_scale_val = gQScale[bidx, warp_idx]
 
     # ---- Main KV loop ----
     for n_tile in range(n_kv_blocks):
@@ -316,7 +280,7 @@ def _sage_jit_v2(
     gK:      cute.Tensor,
     gV:      cute.Tensor,
     gO:      cute.Tensor,
-    gQScale: cute.Tensor,
+    gQScale: cute.Tensor,   # 2D: (B*H*N_Q_BLOCKS, WARPS_PER_BLOCK)
     gKScale: cute.Tensor,
     n_kv_blocks: cute.Int32,
     n_q_blocks:  cute.Int32,
@@ -377,98 +341,133 @@ def _sage_jit_v2(
 # ============================================================
 # AOT 编译缓存
 # ============================================================
-_compiled_kernels: dict = {}
+_compiled_kernels_v2: dict = {}
 
 
-def _get_compiled(B, H, N, D, kv_len, q_int8, k_int8_tiles, v_tiles, out,
-                  q_scale_flat, k_scale_2d, N_KV_BLOCKS, N_Q_BLOCKS, N_CTAs):
+def _get_compiled_v2(B, H, N, D, kv_len, q_tiles, k_tiles, v_tiles, out,
+                     q_scale_2d, k_scale_2d, N_KV_BLOCKS, N_Q_BLOCKS, N_CTAs):
     key = (B, H, N, D, kv_len)
-    if key not in _compiled_kernels:
-        _compiled_kernels[key] = cute.compile(
+    if key not in _compiled_kernels_v2:
+        _compiled_kernels_v2[key] = cute.compile(
             _sage_jit_v2,
-            from_dlpack(q_int8, assumed_align=128),
-            from_dlpack(k_int8_tiles, assumed_align=128),
+            from_dlpack(q_tiles, assumed_align=128),
+            from_dlpack(k_tiles, assumed_align=128),
             from_dlpack(v_tiles, assumed_align=128),
             from_dlpack(out),
-            from_dlpack(q_scale_flat),
+            from_dlpack(q_scale_2d),   # 2D: (B*H*N_Q_BLOCKS, WARPS_PER_BLOCK)
             from_dlpack(k_scale_2d),
             cute.Int32(N_KV_BLOCKS),
             cute.Int32(N_Q_BLOCKS),
             cute.Int32(N_CTAs),
         )
-    return _compiled_kernels[key]
+    return _compiled_kernels_v2[key]
 
 
 # ============================================================
 # Public API
 # ============================================================
-def sageattn_cutedsl(
+def sageattn_cutedsl_v2(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     is_causal: bool = False,
     sm_scale: float = None,
     smooth_k: bool = True,
+    smooth_v: bool = True,
 ) -> torch.Tensor:
     """
-    SageAttention CuTe DSL 前向传播 (SM90a WGMMA, 128-bit vectorized + K double buffering).
+    SageAttention V2 CuTe DSL 前向传播 (SM90a WGMMA).
+
+    V2 特性:
+    - Q: per-warp INT8 量化（WARPQ=16，每 BLOCK_M=64 有 4 个 scale）
+    - K: per-block INT8 + K Smoothing（同 V1）
+    - V: FP8 per-channel 量化（round-trip dequantize 回 FP16）+ V Smoothing
 
     参数:
-        q, k, v: (B, H, N, D) float16, CUDA
-        is_causal: 因果 mask (暂未实现)
-        sm_scale: softmax 缩放 (默认 D^{-0.5})
-        smooth_k: K Smoothing
+        q, k, v  : (B, H, N, D) float16, CUDA
+        is_causal: 因果 mask（暂未实现）
+        sm_scale : softmax 缩放（默认 D^{-0.5}）
+        smooth_k : K Smoothing（默认 True）
+        smooth_v : V Smoothing（默认 True）
+
+    返回:
+        out: (B, H, N, D) float16
     """
     assert q.is_cuda and q.dtype == torch.float16
     B, H, N, D = q.shape
-    assert D == HEAD_DIM, f"sageattn_cutedsl: 只支持 head_dim={HEAD_DIM}, got {D}"
+    assert D == HEAD_DIM, f"sageattn_cutedsl_v2: 只支持 head_dim={HEAD_DIM}, got {D}"
     assert N % BLOCK_M == 0, f"N={N} 必须是 BLOCK_M={BLOCK_M} 的整数倍"
     assert N % BLOCK_N == 0, f"N={N} 必须是 BLOCK_N={BLOCK_N} 的整数倍"
+    assert N % WARPQ == 0, f"N={N} 必须是 WARPQ={WARPQ} 的整数倍"
 
     if sm_scale is None:
         sm_scale = D ** -0.5
 
-    # K 量化
+    # ------------------------------------------------------------------
+    # K 量化（同 V1: per-block INT8 + K Smoothing）
+    # ------------------------------------------------------------------
     if smooth_k:
         k_int8, k_scale, km = smooth_and_quant_k_gpu(k, block_sz=BLOCK_N)
     else:
         k_int8, k_scale = quant_per_block_int8(k, sm_scale=1.0, block_sz=BLOCK_N)
 
-    # Q 量化
-    q_int8, q_scale = quant_q_per_block_gpu(q, sm_scale)
+    # ------------------------------------------------------------------
+    # V FP8 per-channel 量化 → dequantize 回 FP16（含量化噪声）
+    # ------------------------------------------------------------------
+    v_fp16, v_scale, vm = quant_v_per_channel_fp8(v, smooth_v=smooth_v)
+    # v_fp16: (B, H, N, D) fp16, ready for FP16 PV GEMM
+    # vm    : (B, H, 1, D) fp16 or None, add back in Python epilogue
+
+    # ------------------------------------------------------------------
+    # Q per-warp INT8 量化
+    # ------------------------------------------------------------------
+    q_int8, q_scale_2d = quant_q_per_warp_int8_gpu(q, sm_scale, BLOCK_M=BLOCK_M, WARPQ=WARPQ)
+    # q_scale_2d: (B, H, N // BLOCK_M, WARPS_PER_BLOCK)
 
     N_Q_BLOCKS  = N // BLOCK_M
     N_KV_BLOCKS = N // BLOCK_N
     N_CTAs      = B * H * N_Q_BLOCKS
 
+    # ------------------------------------------------------------------
     # Tile-contiguous 重排
+    # ------------------------------------------------------------------
+    # K: (B, H, N_KV_BLOCKS, BLOCK_N, D) → (B*H, N_KV_BLOCKS, BLOCK_N, D)
     k_tiles = k_int8.view(B, H, N_KV_BLOCKS, BLOCK_N, D)
     k_tiles = k_tiles.reshape(B * H, N_KV_BLOCKS, BLOCK_N, D).contiguous()
 
-    # V: keep transposed (HEAD_DIM, BLOCK_N) layout for ROW_MAJOR K-major smem
-    v_tiles = v.view(B, H, N_KV_BLOCKS, BLOCK_N, D)
-    v_tiles = v_tiles.permute(0, 1, 2, 4, 3)   # (B, H, N_KV_BLOCKS, D, BLOCK_N)
+    # V (FP16 after FP8 round-trip): transposed (HEAD_DIM, BLOCK_N) layout
+    v_tiles = v_fp16.view(B, H, N_KV_BLOCKS, BLOCK_N, D)
+    v_tiles = v_tiles.permute(0, 1, 2, 4, 3)               # (B, H, N_KV_BLOCKS, D, BLOCK_N)
     v_tiles = v_tiles.reshape(B * H, N_KV_BLOCKS, D, BLOCK_N).contiguous()
 
+    # Q: (B, H, N_Q_BLOCKS, BLOCK_M, D) → (B*H*N_Q_BLOCKS, BLOCK_M, D)
     q_tiles = q_int8.view(B, H, N_Q_BLOCKS, BLOCK_M, D)
     q_tiles = q_tiles.reshape(B * H * N_Q_BLOCKS, BLOCK_M, D).contiguous()
 
-    out = torch.empty(B * H * N_Q_BLOCKS, BLOCK_M, D, dtype=torch.float32, device=q.device)
-    q_scale_flat = q_scale.reshape(B * H * N_Q_BLOCKS).contiguous()
-    k_scale_2d   = k_scale.reshape(B * H, N_KV_BLOCKS).contiguous()
+    # Q scale 2D: (B, H, N_Q_BLOCKS, WARPS_PER_BLOCK) → (B*H*N_Q_BLOCKS, WARPS_PER_BLOCK)
+    q_scale_bh = q_scale_2d.reshape(B * H * N_Q_BLOCKS, WARPS_PER_BLOCK).contiguous()
 
-    compiled = _get_compiled(
+    # K scale 2D: (B, H, N_KV_BLOCKS) → (B*H, N_KV_BLOCKS)
+    k_scale_2d = k_scale.reshape(B * H, N_KV_BLOCKS).contiguous()
+
+    # Output buffer: (B*H*N_Q_BLOCKS, BLOCK_M, D) fp32
+    out_buf = torch.empty(B * H * N_Q_BLOCKS, BLOCK_M, D, dtype=torch.float32, device=q.device)
+
+    # ------------------------------------------------------------------
+    # Kernel launch
+    # ------------------------------------------------------------------
+    compiled = _get_compiled_v2(
         B, H, N, D, N,
-        q_tiles, k_tiles, v_tiles, out,
-        q_scale_flat, k_scale_2d,
+        q_tiles, k_tiles, v_tiles, out_buf,
+        q_scale_bh, k_scale_2d,
         N_KV_BLOCKS, N_Q_BLOCKS, N_CTAs,
     )
     compiled(
         from_dlpack(q_tiles, assumed_align=128),
         from_dlpack(k_tiles, assumed_align=128),
         from_dlpack(v_tiles, assumed_align=128),
-        from_dlpack(out),
-        from_dlpack(q_scale_flat),
+        from_dlpack(out_buf),
+        from_dlpack(q_scale_bh),
         from_dlpack(k_scale_2d),
         cute.Int32(N_KV_BLOCKS),
         cute.Int32(N_Q_BLOCKS),
@@ -476,4 +475,11 @@ def sageattn_cutedsl(
     )
     torch.cuda.synchronize()
 
-    return out.view(B, H, N, D).to(torch.float32)
+    # ------------------------------------------------------------------
+    # Python epilogue: V mean recovery (V Smoothing)
+    # ------------------------------------------------------------------
+    out = out_buf.view(B, H, N, D)      # (B, H, N, D) fp32
+    if smooth_v and vm is not None:
+        out = out + vm.to(torch.float32)   # vm: (B, H, 1, D) fp16 → fp32, broadcasts over N
+
+    return out.to(torch.float16)

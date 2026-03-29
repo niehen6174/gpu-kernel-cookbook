@@ -6,6 +6,7 @@ SageAttention vs FlashAttention 对比测试
 2. 长序列 benchmark：N in [1024, 2048, 4096, 8192, 16384]
    对比：FlashAttention v2（官方）vs SageAttention v1/v2（本实现 Triton）
           vs 官方 SageAttention 包（若已安装）
+          vs CuTe DSL v2/v3（BLOCK_M=64/128, split-warpgroup）
 
 运行：
     cd gpu-kernel-lab
@@ -22,6 +23,15 @@ from common.check import check_correctness
 from common.utils import benchmark_func, compute_tflops, get_gpu_info
 from operators.sageattention.triton.kernel_v1 import sageattn_v1
 from operators.sageattention.triton.kernel_v2 import sageattn_v2
+
+# CuTe DSL kernels (SM90a Hopper only)
+try:
+    from operators.sageattention.cute.kernel import sageattn_cutedsl
+    from operators.sageattention.cute.kernel_v3 import sageattn_cutedsl_v3
+    HAS_CUTE = True
+except Exception as e:
+    HAS_CUTE = False
+    print(f"[WARN] CuTe DSL kernels not available: {e}")
 
 
 # ============================================================
@@ -128,6 +138,13 @@ def test_correctness():
         if HAS_SAGE_PKG:
             check_correctness(sage_official(q, k, v), ref,
                               name=f"SageAttn official N={N} D={D}", atol=0.05, rtol=0.02)
+
+        # CuTe DSL v2/v3 (仅支持 D=64, SM90a)
+        if HAS_CUTE and D == 64:
+            check_correctness(sageattn_cutedsl(q, k, v, smooth_k=True).to(torch.float16), ref,
+                              name=f"CuTe DSL v2 N={N} D={D}", atol=0.05, rtol=0.02)
+            check_correctness(sageattn_cutedsl_v3(q, k, v, smooth_k=True).to(torch.float16), ref,
+                              name=f"CuTe DSL v3 N={N} D={D}", atol=0.05, rtol=0.02)
 
     # 因果注意力测试
     print("\n  [Causal Attention] B=1 H=8 N=1024 D=64")
@@ -291,6 +308,11 @@ def run_detailed_benchmark(B=1, H=16, N=4096, D=64):
         ("SageAttn v2 (smooth_kv)",        lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=True)),
         ("SageAttn v2 (smooth_k only)",    lambda: sageattn_v2(q, k, v, smooth_k=True, smooth_v=False)),
     ]
+    if HAS_CUTE and D == 64:
+        impls += [
+            ("CuTe DSL v2 (BLOCK_M=64)",   lambda: sageattn_cutedsl(q, k, v, smooth_k=True)),
+            ("CuTe DSL v3 (BLOCK_M=128)",  lambda: sageattn_cutedsl_v3(q, k, v, smooth_k=True)),
+        ]
     if HAS_SAGE_PKG:
         impls.append(("SageAttn official",            lambda: sage_official(q, k, v)))
 

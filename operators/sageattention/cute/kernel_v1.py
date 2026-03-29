@@ -55,10 +55,10 @@ LOG2_E = 1.4426950408889634
 
 
 # ============================================================
-# Python 层量化
+# Python 层量化（CPU 版，保留用于调试 / 对比）
 # ============================================================
-def smooth_and_quant_k(k: torch.Tensor) -> tuple:
-    """K Smoothing + per-block INT8 量化（K 不含 sm_scale）。"""
+def _smooth_and_quant_k_cpu(k: torch.Tensor) -> tuple:
+    """K Smoothing + per-block INT8 量化（CPU Python 循环版，仅用于调试）。"""
     B, H, N, D = k.shape
     km = k.float().mean(dim=2, keepdim=True)
     k_s = (k.float() - km).to(torch.float16)
@@ -82,8 +82,8 @@ def smooth_and_quant_k(k: torch.Tensor) -> tuple:
     return k_int8, k_scale, km.to(torch.float16)
 
 
-def quant_q_per_block(q: torch.Tensor, sm_scale: float) -> tuple:
-    """Q per-block INT8 量化，scale 融合 sm_scale * log2(e)。"""
+def _quant_q_per_block_cpu(q: torch.Tensor, sm_scale: float) -> tuple:
+    """Q per-block INT8 量化（CPU Python 循环版，仅用于调试）。"""
     B, H, N, D = q.shape
     nblocks = (N + BLOCK_M - 1) // BLOCK_M
     q_int8  = torch.empty_like(q, dtype=torch.int8)
@@ -104,6 +104,10 @@ def quant_q_per_block(q: torch.Tensor, sm_scale: float) -> tuple:
                 q_scale[b, h, bm] = sc
 
     return q_int8, q_scale
+
+
+# GPU 量化 (Triton kernel)
+from .quant import quant_q_per_block_gpu, smooth_and_quant_k_gpu
 
 
 # ============================================================
@@ -517,27 +521,17 @@ def sageattn_v1_cute(
     if sm_scale is None:
         sm_scale = D ** -0.5
 
-    # K Smoothing + 量化
+    # K Smoothing + 量化 (GPU Triton kernel)
     if smooth_k:
-        k_int8, k_scale, km = smooth_and_quant_k(k)
+        k_int8, k_scale, km = smooth_and_quant_k_gpu(k)
     else:
-        nblocks_k = N // BLOCK_N
-        k_int8  = torch.empty_like(k, dtype=torch.int8)
-        k_scale = torch.empty((B, H, nblocks_k), dtype=torch.float32, device=k.device)
-        for b in range(B):
-            for h_i in range(H):
-                for bn in range(nblocks_k):
-                    s = bn * BLOCK_N
-                    blk = k[b, h_i, s:s+BLOCK_N, :].float()
-                    sc  = blk.abs().max() / 127.0 + 1e-7
-                    k_int8[b, h_i, s:s+BLOCK_N, :] = (
-                        (blk / sc + 0.5 * blk.sign()).clamp(-128, 127).to(torch.int8)
-                    )
-                    k_scale[b, h_i, bn] = sc
+        # No-smooth path: quantize K without subtracting mean
+        from .quant import quant_per_block_int8
+        k_int8, k_scale = quant_per_block_int8(k, sm_scale=1.0)
         km = None
 
-    # Q 量化
-    q_int8, q_scale = quant_q_per_block(q, sm_scale)
+    # Q 量化 (GPU Triton kernel)
+    q_int8, q_scale = quant_q_per_block_gpu(q, sm_scale)
 
     N_Q_BLOCKS  = N // BLOCK_M
     N_KV_BLOCKS = N // BLOCK_N
