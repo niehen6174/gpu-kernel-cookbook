@@ -16,6 +16,8 @@
    - [v2：rs-mode + 向量化 + K double buffering](#v2rs-mode--向量化--k-double-buffering)
    - [v2 尝试优化与受阻项](#v2-尝试优化与受阻项)
    - [SageAttention V2 量化升级](#sageattention-v2-量化升级)
+   - [v3：BLOCK_M=128 split-warpgroup](#v3block_m128-split-warpgroup)
+   - [v4：FP8 V GMEM 带宽优化（调试中）](#v4fp8-v-gmem-带宽优化)
 4. [性能基准](#4-性能基准)
 5. [关键实现细节](#5-关键实现细节)
 6. [已知问题与受阻项](#6-已知问题与受阻项)
@@ -62,6 +64,7 @@ operators/sageattention/cute/
 | `kernel.py` | rs-mode PV GEMM | Triton GPU kernel | ✅ 高性能主实现（SageAttention V1，BM=64） |
 | `kernel_v2.py` | rs-mode PV GEMM | per-warp Q INT8 + FP8 V round-trip | ✅ SageAttention V2 实现 |
 | `kernel_v3.py` | rs-mode PV GEMM, split-WG | Triton GPU kernel | ✅ BLOCK_M=128 双 WG 实现 |
+| `kernel_v4.py` | rs-mode PV GEMM, split-WG, FP8 V | FP8 V GMEM + per-tile scale | 🔴 N=384/512/1024 有确定性 Bug（调试中）|
 | `quant.py` | — | Triton + PyTorch | ✅ 通用量化模块 |
 
 ---
@@ -327,6 +330,7 @@ V 自然布局为 `(BLOCK_N, HEAD_DIM)` 行主序（HEAD_DIM 连续）。
 | FP8 PV GEMM（kernel 内） | 🔴 受阻 | CuTe DSL 不支持标量 fp32→fp8 转换（需向量化输入），rs-mode 逐元素赋值无法生成合法 IR；V2 采用 round-trip 方案绕过 |
 | 消除 V permute | 🔴 受阻 | COL_MAJOR smem MN_SW128 swizzle 与 cp.async 对齐要求冲突 |
 | is_causal 未实现 | 🟡 已知 | 所有版本均未支持因果 mask |
+| **v4 N≥384 确定性失败** | 🔴 调试中 | `head_flat ≡ 2 (mod 4)` 的 head 在 N=384/512 时 100% 错误（见 v4 章节详细分析）；疑似 `copy_f8_reg`（flat src）与 `copy_f16_reg`（swizzled dst）4-pass 遍历顺序不一致 |
 
 ---
 
@@ -524,6 +528,156 @@ WG1 (tidx 128-255): sQ1 = rows 64-127, 独立 QK GEMM + softmax + PV GEMM → O 
   - 两个 warpgroup 在 barrier 点需要汇合（串行化点）
   - sK 必须等两个 WG 都完成 GEMM 才能覆写（需额外 barrier）
 - **对比官方 SageAttention**：v3 在 N=4096 时达到官方 1.5× 的性能（91T vs 138T TFLOPS）
+
+---
+
+### v4：FP8 V GMEM 带宽优化
+
+**目标**：在 v3 的 split-warpgroup 基础上，将 V 的 GMEM 存储从 FP16 改为 FP8 E4M3FN，GMEM 带宽减半（每 tile 8KB → 4KB）。
+
+#### 设计概述
+
+```
+v3: sV(FP16, 8KB/tile) — 直接 cp.async FP16 → swizzled smem → WGMMA
+v4: gV(FP8, 4KB/tile) → sV_f8(FP8, 4KB flat) → [FP8→FP16 smem转换] → sV_f16(FP16, 8KB swizzled) → WGMMA
+```
+
+**内存布局变化（vs v3）**：
+```
+sQ0(4KB) + sQ1(4KB) + sK(8KB×2stage) + sV_f8(4KB) + sV_f16_0(8KB) + sV_f16_1(8KB) = 36KB
+```
+（vs v3 的 24KB；H20 共 228KB smem，仍可 4 CTA/SM）
+
+**V dequant 融合**：
+```
+softmax 时:  rP[i] = Float16(exp2(...) * v_scale_val)   — P × v_scale 写入 rP
+PV GEMM:     acc_O += rP × sV_f16_wgX                   — (P × v_scale) × (V_fp8 × 1/v_scale) = P × V_real
+```
+V scale 乘法融入 softmax（免费），PV GEMM 精度不变。
+
+#### FP8→FP16 smem 转换：跨 WG 可见性分析
+
+**核心问题**：`wgmma.fence.sync.aligned`（即 `warpgroup.fence()`）只对**调用 WG 自身**发出的 generic memory store 提供顺序保证，无法覆盖其他 WG 的 store。
+
+**初始方案（有 Bug）**：256 线程共同写一个 `sV_f16` 缓冲：
+```
+全部 256 线程写 sV_f16
+→ WG0 的 warpgroup.fence() 只能看到 WG0（tidx 0-127）写的元素
+→ WG1 写的另一半元素在 WG0 的 WGMMA 中不可见
+→ 非确定性错误（~50%失败）
+```
+
+**修复方案：per-WG 私有 sV_f16 缓冲**：
+```python
+# SS struct 中各 WG 有独立缓冲：
+sV_f16_0: Float16 (8KB, WG0 专用)
+sV_f16_1: Float16 (8KB, WG1 专用)
+
+# WG0 写满 sV_f16_0（128线程×32元素×4 pass = 4096元素）
+# WG0 的 warpgroup.fence() → 覆盖所有 WG0 写的 sV_f16_0 元素
+# WG0 WGMMA 读 sV_f16_0 → 可见性完整
+
+# 同理 WG1 操作 sV_f16_1
+```
+
+这需要每个 WG 独立完成整个 4096 元素的 FP8→FP16 转换，虽有重复计算但保证了正确性。
+
+**128线程 tiled copy（per-WG）**：
+```python
+# FP8 smem→reg: 64-bit 原子，8 FP8/thread
+# TV layout: (16,8):(8,1) × (1,8)  →  tiler (16,64)
+# 4 pass × 128线程 × 8元素 = 4096元素 ✓
+ca_f8_reg  = make_copy_atom(CopyUniversalOp(), Float8E4M3FN, num_bits=64)
+copy_f8_reg = make_tiled_copy_tv(ca_f8_reg, (16,8):(8,1), (1,8))
+
+# FP16 reg→smem: 128-bit 原子，8 FP16/thread
+# 与 FP8 pass 数匹配
+ca_f16_reg  = make_copy_atom(CopyUniversalOp(), Float16, num_bits=128)
+copy_f16_reg = make_tiled_copy_tv(ca_f16_reg, (16,8):(8,1), (1,8))
+```
+
+**两步 FP8→FP16 转换**（CuTe DSL 约束）：
+```python
+# 错误：.to(Float16) → arith.extf(f16→f16) IR 报错
+# 正确：
+reg_f16.store(reg_f8.load().to(Float32).to(Float16))  # F32 作中间类型
+```
+
+**sV_f8 用 flat 布局（无 swizzle）**：
+```python
+sV_f8_layout = cute.make_layout((HEAD_DIM, BLOCK_N), stride=(BLOCK_N, 1))
+```
+cp.async 写 sV_f8 用 Int8 recast（无 swizzle），FP8 读也用相同 flat 布局，避免写/读 swizzle 不一致。
+
+#### 正确性验证进展
+
+测试日期：2026-03-30，NVIDIA H20 SM90a
+
+**已通过的配置**：
+
+| B | H | N | 状态 | 备注 |
+|---|---|---|---|---|
+| 任意 | 任意 | 128 (N_KV=2) | ✅ PASS | 修复 end-of-loop barrier 后解决 |
+| 任意 | 任意 | 256 (N_KV=4) | ✅ PASS | per-WG buffer 方案修复后 |
+
+**仍存在 Bug 的配置**：
+
+| B | H | N | 状态 | 误差 |
+|---|---|---|---|---|
+| ≥1 | ≥1 | 384 (N_KV=6) | ❌ FAIL | ~0.02–0.03 |
+| ≥1 | ≥1 | 512 (N_KV=8) | ❌ FAIL | ~0.2 |
+
+#### 调试过程与发现
+
+**Bug 1（已修复）：end-of-loop barrier 缺失**
+
+N=128（N_KV=2）有约 2% 的非确定性失败。原因：当 `n_tile+2 >= n_kv_blocks` 时没有 K 预取，也没有 `barrier()`，导致最后一次循环两 WG 不同步。修复：加 `else: cute.arch.barrier()`。
+
+**Bug 2（已修复）：共享 sV_f16 缓冲跨 WG 可见性**
+
+N=256（N_KV=4）约 50% 失败。根本原因：256 线程共写 `sV_f16`，`warpgroup.fence()` 只覆盖本 WG 的 store。修复：引入 `sV_f16_0` / `sV_f16_1` 独立缓冲。
+
+**Bug 3（未解决）：N=384 确定性失败，pattern = head_flat ≡ 2 (mod 4)**
+
+诊断测试（`/tmp/debug_head_pattern.py`）发现：
+
+```
+B=1,H=4,N=384:  hf0✓  hf1✓  hf2❌(0.022)  hf3✓
+B=1,H=8,N=384:  hf{0,1,3,4,5,7}✓  hf{2,6}❌
+B=4,H=3,N=384:  hf{2,6,10}❌  其余✓
+B=4,H=8,N=256:  全部✓  (N_KV=4，不触发)
+```
+
+关键排除项：
+- `V = constant per tile` → **掩盖 Bug**（max error ≤ 0.002，在误差范围内）。
+  意味着 K pipeline、softmax、v_scale 索引均正确；Bug 在 **tile 内元素级别的 smem 寻址**。
+- `V = randn` → 误差与 V 量级成正比（~1/V_scale 缩放关系）。
+
+**根因假设**：
+
+`copy_f8_reg`（源：flat `sV_f8`）和 `copy_f16_reg`（目标：swizzled `sV_f16_wgX`）使用相同的 TV layout `(16,8):(8,1) × (1,8)`，tiler = `(16,64)`，需 **4 pass** 覆盖 `(64,64)` tile。
+
+当源是 flat（无 swizzle）而目标有 swizzle 时，两者的 pass 遍历顺序（element index → logical (row, col)）可能在某个 pass 不一致，导致特定元素写入 smem 的错误逻辑位置。`head_flat ≡ 2 (mod 4)` 的周期性正好与 4-pass 循环对应。
+
+**待验证的修复方向**：
+
+1. 改用 **flat（无 swizzle）sV_f16** 目标，验证 Bug 是否消失（确认是 swizzle mismatch）。
+2. 如果确认，改为两个独立的 `cute.copy` 步骤：先用 flat copy 写 sV_f16_flat，再用 smem-to-smem copy 将 flat 转为 swizzled。
+3. 或：使用完全不同的 tile 结构（128线程 × 32元素 × 1 pass = 4096 elements，避免多 pass）。
+
+#### 变更日志（v4 部分）
+
+| 日期 | 文件 | 变更内容 |
+|---|---|---|
+| 2026-03-29 | `cute/kernel_v4.py` | 新建：FP8 V GMEM 版本，基于 v3 split-WG 架构 |
+| 2026-03-29 | `cute/kernel_v4.py` | 修复 Bug 1：加入 end-of-loop `else: barrier()` |
+| 2026-03-30 | `cute/kernel_v4.py` | 修复 Bug 2：引入 per-WG 私有 sV_f16_0/sV_f16_1 缓冲，解决跨 WG WGMMA 可见性 |
+| 2026-03-30 | `cute/CUTLASS_CPP_ANALYSIS.md` | 新建：CUTLASS C++ SageAttention 实现可行性分析 |
+| 2026-03-30 | `cute/__init__.py` | 新增 kernel_v4 导出 |
+| 2026-03-30 | `test.py` | 新增 v4 正确性测试和 benchmark 入口 |
+| 2026-03-30 | `cute/DEVLOG.md` | 更新：记录 v4 实现过程和 Bug 3 调试进展 |
+
+---
 
 | 日期 | 文件 | 变更内容 |
 |---|---|---|
