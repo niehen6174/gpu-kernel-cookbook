@@ -4,6 +4,11 @@ Test harness for the standalone SageAttention SM90 kernel.
 Validates that the locally-built kernel produces identical results
 and matching performance compared to the official sageattention package.
 
+Three benchmark modes:
+  1. Kernel-only:  local kernel vs official kernel (same inputs, fair comparison)
+  2. End-to-end:   local (quant+kernel) vs official API (quant+kernel)
+  3. Standalone:    local kernel TFLOPS across sequence lengths
+
 Usage:
     # From gpu-kernel-lab root:
     python -m operators.sageattention.cuda.test
@@ -46,21 +51,31 @@ def load_local_module():
 
 
 def load_official_module():
-    """Load the official sageattention package."""
+    """Load the official sageattention package (both Python API and raw CUDA module)."""
+    result = {}
     try:
         from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
         from sageattention.quant import per_warp_int8, per_channel_fp8
         from sageattention.triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
-        print("[OK] Official sageattention loaded")
-        return {
-            'sageattn': sageattn_qk_int8_pv_fp8_cuda_sm90,
-            'per_warp_int8': per_warp_int8,
-            'per_channel_fp8': per_channel_fp8,
-            'per_thread_int8': per_thread_int8_triton,
-        }
+        result['sageattn'] = sageattn_qk_int8_pv_fp8_cuda_sm90
+        result['per_warp_int8'] = per_warp_int8
+        result['per_channel_fp8'] = per_channel_fp8
+        result['per_thread_int8'] = per_thread_int8_triton
+        print("[OK] Official sageattention Python API loaded")
     except ImportError as e:
         print(f"[WARN] Official sageattention not available: {e}")
         return None
+
+    # Also load the official raw CUDA kernel module for fair kernel-only comparison
+    try:
+        import sageattention._qattn_sm90 as official_cuda
+        result['official_cuda'] = official_cuda
+        print("[OK] Official _qattn_sm90 CUDA module loaded (for kernel-only comparison)")
+    except ImportError:
+        print("[WARN] Cannot load official _qattn_sm90 CUDA module directly")
+        result['official_cuda'] = None
+
+    return result
 
 
 def generate_inputs(batch, num_heads, seq_len, head_dim, dtype=DTYPE, device=DEVICE):
@@ -73,9 +88,7 @@ def generate_inputs(batch, num_heads, seq_len, head_dim, dtype=DTYPE, device=DEV
 
 def quantize_inputs(q, k, v, official_funcs, tensor_layout="HND", qk_quant_gran="per_warp"):
     """Quantize Q, K, V using the official sageattention quantization kernels."""
-    _tensor_layout = 1  # HND
     seq_dim = 2
-    nh_dim = 1
     sm_scale = q.size(-1) ** -0.5
 
     # K smoothing
@@ -109,14 +122,14 @@ def quantize_inputs(q, k, v, official_funcs, tensor_layout="HND", qk_quant_gran=
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, _qk_quant_gran, sm_scale
 
 
-def run_local_kernel(local_module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
-                     output_shape, dtype, qk_quant_gran, sm_scale, is_causal=0):
-    """Run the locally-built SM90 kernel."""
+def run_kernel(module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
+               output_shape, dtype, qk_quant_gran, sm_scale, is_causal=0):
+    """Run an SM90 kernel (local or official module)."""
     o = torch.empty(output_shape, dtype=dtype, device=DEVICE)
     tensor_layout = 1  # HND
     return_lse = 0
 
-    lse = local_module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+    module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
         q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
         tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse
     )
@@ -173,11 +186,11 @@ def test_correctness(local_module, official_funcs):
                 sm_scale=sm_scale, pv_accum_dtype="fp32+fp32", smooth_k=True
             )
 
-        # Local kernel
+        # Local kernel (using same quantized inputs)
         q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, qk_gran, _ = quantize_inputs(
             q, k, v, official_funcs, qk_quant_gran="per_warp"
         )
-        local_out = run_local_kernel(
+        local_out = run_kernel(
             local_module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
             q.shape, q.dtype, qk_gran, sm_scale
         )
@@ -200,54 +213,101 @@ def test_correctness(local_module, official_funcs):
             print(f"  N={seq_len:5d}: local_vs_pytorch_ref(max={diff_vs_ref:.4f})")
 
 
-def test_performance(local_module, official_funcs):
-    """Benchmark local kernel vs official sageattention."""
+def test_kernel_vs_kernel(local_module, official_funcs):
+    """Fair kernel-only comparison: local kernel vs official kernel (same quantized inputs)."""
+    official_cuda = official_funcs.get('official_cuda') if official_funcs else None
+    if official_cuda is None:
+        print("\n[SKIP] Kernel-vs-kernel benchmark: official _qattn_sm90 CUDA module not available")
+        return
+
     print("\n" + "=" * 70)
-    print("PERFORMANCE BENCHMARK")
+    print("KERNEL vs KERNEL (same quantized inputs, fair comparison)")
     print("=" * 70)
     print(f"  B={BATCH}, H={NUM_HEADS}, D={HEAD_DIM}, dtype={DTYPE}")
-    print(f"  {'N':>6s}  {'Local(ms)':>10s}  {'Official(ms)':>12s}  {'Ratio':>7s}  {'TFLOPS':>8s}")
-    print("  " + "-" * 55)
+    print(f"  {'N':>6s}  {'Local(ms)':>10s}  {'Official(ms)':>12s}  {'Speedup':>8s}  "
+          f"{'Local TFLOPS':>13s}  {'Official TFLOPS':>16s}")
+    print("  " + "-" * 76)
 
     for seq_len in SEQ_LENS:
         q, k, v = generate_inputs(BATCH, NUM_HEADS, seq_len, HEAD_DIM)
         sm_scale = HEAD_DIM ** -0.5
 
-        # Prepare quantized inputs
+        # Shared quantized inputs
         q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, qk_gran, _ = quantize_inputs(
             q, k, v, official_funcs, qk_quant_gran="per_warp"
         )
 
-        # Local kernel benchmark
+        # Pre-allocate output buffers
+        o_local = torch.empty(q.shape, dtype=q.dtype, device=DEVICE)
+        o_official = torch.empty(q.shape, dtype=q.dtype, device=DEVICE)
+
         def run_local():
-            return run_local_kernel(
+            local_module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+                q_int8, k_int8, v_fp8, o_local, q_scale, k_scale, v_scale,
+                1, 0, qk_gran, sm_scale, 0)
+
+        def run_official():
+            official_cuda.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+                q_int8, k_int8, v_fp8, o_official, q_scale, k_scale, v_scale,
+                1, 0, qk_gran, sm_scale, 0)
+
+        local_ms = benchmark_fn(run_local)
+        official_ms = benchmark_fn(run_official)
+
+        flops = 2 * 2 * BATCH * NUM_HEADS * seq_len * seq_len * HEAD_DIM
+        local_tflops = flops / (local_ms / 1000) / 1e12
+        official_tflops = flops / (official_ms / 1000) / 1e12
+        speedup = official_ms / local_ms  # >1 means local is faster
+
+        print(f"  {seq_len:6d}  {local_ms:10.3f}  {official_ms:12.3f}  {speedup:7.3f}×  "
+              f"{local_tflops:13.2f}  {official_tflops:16.2f}")
+
+
+def test_e2e_performance(local_module, official_funcs):
+    """End-to-end benchmark: local (quant+kernel) vs official API (quant+kernel)."""
+    print("\n" + "=" * 70)
+    print("END-TO-END PERFORMANCE (quantization + kernel)")
+    print("=" * 70)
+    print(f"  B={BATCH}, H={NUM_HEADS}, D={HEAD_DIM}, dtype={DTYPE}")
+    print(f"  {'N':>6s}  {'Local E2E(ms)':>13s}  {'Official E2E(ms)':>16s}  {'Speedup':>8s}  {'Local TFLOPS':>13s}")
+    print("  " + "-" * 66)
+
+    for seq_len in SEQ_LENS:
+        q, k, v = generate_inputs(BATCH, NUM_HEADS, seq_len, HEAD_DIM)
+        sm_scale = HEAD_DIM ** -0.5
+
+        # Local end-to-end: quantize + kernel
+        def run_local_e2e():
+            q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, qk_gran, _ = quantize_inputs(
+                q, k, v, official_funcs, qk_quant_gran="per_warp"
+            )
+            return run_kernel(
                 local_module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
                 q.shape, q.dtype, qk_gran, sm_scale
             )
-        local_ms = benchmark_fn(run_local)
+        local_ms = benchmark_fn(run_local_e2e)
 
-        # Compute TFLOPS (2 * B * H * N * N * D for QK, + 2 * B * H * N * N * D for PV)
         flops = 2 * 2 * BATCH * NUM_HEADS * seq_len * seq_len * HEAD_DIM
-        tflops = flops / (local_ms / 1000) / 1e12
+        local_tflops = flops / (local_ms / 1000) / 1e12
 
-        # Official benchmark
+        # Official end-to-end
         if official_funcs:
-            def run_official():
+            def run_official_e2e():
                 return official_funcs['sageattn'](
                     q, k, v, tensor_layout="HND", qk_quant_gran="per_warp",
                     sm_scale=sm_scale, pv_accum_dtype="fp32+fp32", smooth_k=True
                 )
-            official_ms = benchmark_fn(run_official)
-            ratio = local_ms / official_ms
-            print(f"  {seq_len:6d}  {local_ms:10.3f}  {official_ms:12.3f}  {ratio:7.3f}  {tflops:8.2f}")
+            official_ms = benchmark_fn(run_official_e2e)
+            speedup = official_ms / local_ms
+            print(f"  {seq_len:6d}  {local_ms:13.3f}  {official_ms:16.3f}  {speedup:7.3f}×  {local_tflops:13.2f}")
         else:
-            print(f"  {seq_len:6d}  {local_ms:10.3f}  {'N/A':>12s}  {'N/A':>7s}  {tflops:8.2f}")
+            print(f"  {seq_len:6d}  {local_ms:13.3f}  {'N/A':>16s}  {'N/A':>8s}  {local_tflops:13.2f}")
 
 
 def test_kernel_only_performance(local_module, official_funcs):
-    """Benchmark just the kernel (no quantization overhead)."""
+    """Benchmark just the local kernel (no quantization overhead)."""
     print("\n" + "=" * 70)
-    print("KERNEL-ONLY PERFORMANCE (no quantization)")
+    print("LOCAL KERNEL-ONLY PERFORMANCE (no quantization)")
     print("=" * 70)
     print(f"  B={BATCH}, H={NUM_HEADS}, D={HEAD_DIM}, dtype={DTYPE}")
     print(f"  {'N':>6s}  {'Kernel(ms)':>10s}  {'TFLOPS':>8s}")
@@ -263,13 +323,13 @@ def test_kernel_only_performance(local_module, official_funcs):
 
         o = torch.empty(q.shape, dtype=q.dtype, device=DEVICE)
 
-        def run_kernel():
+        def run_kernel_only():
             local_module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
                 q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
                 1, 0, qk_gran, sm_scale, 0
             )
 
-        kernel_ms = benchmark_fn(run_kernel)
+        kernel_ms = benchmark_fn(run_kernel_only)
         flops = 2 * 2 * BATCH * NUM_HEADS * seq_len * seq_len * HEAD_DIM
         tflops = flops / (kernel_ms / 1000) / 1e12
 
@@ -305,13 +365,16 @@ def main():
         print("      Tests will run against PyTorch reference only.")
 
     if official_funcs:
-        # Run correctness tests
+        # 1. Correctness test
         test_correctness(local_module, official_funcs)
 
-        # Run performance tests
-        test_performance(local_module, official_funcs)
+        # 2. Fair kernel-vs-kernel comparison (most important!)
+        test_kernel_vs_kernel(local_module, official_funcs)
 
-        # Run kernel-only performance tests
+        # 3. End-to-end comparison
+        test_e2e_performance(local_module, official_funcs)
+
+        # 4. Local kernel-only absolute performance
         test_kernel_only_performance(local_module, official_funcs)
     else:
         print("\n[SKIP] Need official sageattention for correctness/performance tests.")
