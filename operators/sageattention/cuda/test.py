@@ -21,9 +21,9 @@ import torch.nn.functional as F
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 BATCH = 2
-NUM_HEADS = 32
-HEAD_DIM = 64
-SEQ_LENS = [256, 512, 1024, 2048, 4096, 8192]
+NUM_HEADS = 40
+HEAD_DIM = 128
+SEQ_LENS = [256, 512, 1024, 2048, 4096, 8192, 18900, 40500]
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 WARMUP = 5
