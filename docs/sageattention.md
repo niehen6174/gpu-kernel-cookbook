@@ -464,52 +464,72 @@ ALU pipe:           17.7%     17.5%      地址计算, int→float, 比较
 
 根据 **72.8% No Eligible + Tensor Core 24% 利用率** 这两个核心发现，优化必须解决 **TMA 等待 / WGMMA fence 造成的流水线气泡**。
 
-#### [P1] Deep Software Pipeline（TMA Prefetch）
+#### [P1] Deep Software Pipeline（TMA Prefetch）— ❌ 失败
 
-**预期提升: 15-25%** | 难度: 中 | 时间: 1-2 周
-
-```
-当前 (无 pipeline):                    优化后 (2-stage prefetch):
-
-iter i:                                iter i:
-  wait K[i]  ← 阻塞!                    wait K[i]      ← K[i] 已预取完毕
-  QK GEMM                               QK GEMM
-  load K[i+1] ← 才发起加载               load K[i+2]   ← 提前 2 步发起
-  softmax                               softmax
-  wait V[i]  ← 阻塞!                    wait V[i]      ← V[i] 已预取完毕
-  PV GEMM                               PV GEMM
-  load V[i+1]                           load V[i+2]
-```
-
-原理：当前 `load K[i+1]` 在 `QK GEMM[i]` 完成后才发起，而 `wait K[i+1]` 紧接着就需要。TMA 延迟约 200-400 cycles，这段时间完全浪费。提前 2 步发起 TMA，让 WGMMA 计算期间 TMA 并行传输。
-
-实现要点：
-- 双缓冲 K/V smem（已有 mbarrier phase-flip 机制）
-- 将首次 K[0]/K[1]/V[0]/V[1] 提前加载到两个 buffer
-- 主循环中每次迭代发起 `K[i+2]` / `V[i+2]` 的 TMA 请求
-- smem 增加到 4× tile（K×2 + V×2 = 64KB 额外，总计 ~105KB）
-
-#### [P2] CTA_Q=128（双 Q Tile）
-
-**预期提升: 10-20%** | 难度: 中 | 时间: 1 周
+**实际结果: -1% ~ -3% 性能下降** | 原预期: +15-25%
 
 ```
-当前 CTA_Q=64:                         CTA_Q=128:
-  1 个 WGMMA M=64 tile                  2 个 WGMMA M=64 tiles
-  每次 K-iteration:                     每次 K-iteration:
-    1× QK WGMMA + 1× softmax             2× QK WGMMA + 2× softmax
-    1× PV WGMMA                           2× PV WGMMA
-    1× TMA load K/V                       1× TMA load K/V (相同!)
+优化方案: 双缓冲 K/V smem + 提前 2 步 TMA prefetch
+失败原因: smem 40KB → 72KB, 占用率从 5 → 3 CTAs/SM (下降 40%)
+
+关键发现:
+  - L2 hit rate 95.8%, TMA 从 L2 加载延迟很低 (~几十cycles)
+  - 当前 single-buffer parity-flip 已经有效重叠了 TMA 和计算
+  - 额外的 smem 使用 (32KB for double-buffer K+V) 导致占用率大幅下降
+  - 占用率下降完全抵消了 TMA 重叠收益
 ```
 
-核心优势：同样的 TMA load（K/V tile 不变），但做了 2× 的 WGMMA 工作。TMA 和 softmax 的开销被摊薄。
+正确性验证: max_diff < 0.5 ULP BF16, 仅 0.002% 元素有差异 (FP32 指令顺序不同导致的舍入差异)。
 
-代价：
-- Q smem: 8KB → 16KB
-- 输出寄存器 RO 翻倍（可能导致 register 限制 2 blocks/SM）
-- Grid.x 减半（CTA 数量从 N/64 → N/128）
+#### [P2] CTA_Q=128（双 Q Tile）— ❌ 失败
 
-#### [P3] Warp Specialization（生产者-消费者）
+**实际结果: -6% ~ -16% 性能下降** | 原预期: +10-20%
+
+```
+优化方案: CTA_Q=64 → 128, 每次迭代做 2x WGMMA 工作
+失败原因: 寄存器 168 → 255 (硬件上限) + 264-304 bytes 栈溢出
+
+资源分析 (CTA_Q=128, HEAD_DIM=128):
+  RS[2][8][8]     = 128 regs (vs 64)   ← doubled
+  RO[2][8][8]     = 128 regs (vs 64)   ← doubled
+  RO_temp[2][8][8] = 128 regs (vs 64)  ← doubled
+  RS_f32[2][8][8]  = 128 regs (vs 64)  ← doubled
+  总增加 ~256 regs → 超过 255 硬件限制 → 栈溢出
+
+结果:
+  CTA_Q=64:  168 regs, 0 spill, 3 CTAs/SM → 126 TFLOPS
+  CTA_Q=128: 255 regs, 264B spill, 1-2 CTAs/SM → 106-118 TFLOPS
+```
+
+正确性验证: PASS (max_diff=0.003418, per-fq dequant vs fused-sm_scale 顺序差异)。
+
+### 8.3 核心约束分析
+
+两次优化失败揭示了该 kernel 的**核心约束**:
+
+```
+┌──────────────────────────────────────────────────────┐
+│              资源约束分析                               │
+├──────────────────────────────────────────────────────┤
+│                                                       │
+│  寄存器: 168/thread × 128 threads = 21504/CTA         │
+│          65536/SM ÷ 21504 = 3 CTAs/SM (寄存器限制)     │
+│                                                       │
+│  Smem:   40KB/CTA                                     │
+│          228KB/SM ÷ 40KB = 5 CTAs/SM (smem 限制)       │
+│                                                       │
+│  实际占用: 3 CTAs/SM (寄存器瓶颈)                       │
+│                                                       │
+│  结论: 任何增加 per-CTA 资源使用的优化都会降低占用率，    │
+│        而占用率下降的性能损失 > 优化带来的收益            │
+└──────────────────────────────────────────────────────┘
+```
+
+### 8.4 真正有价值的优化方向 (更新)
+
+基于 P1/P2 失败的经验，优化方向必须是**资源中性**或**资源节约**的：
+
+#### [P3] Warp Specialization（生产者-消费者）— 仍然可行
 
 **预期提升: 20-40%** | 难度: 高 | 时间: 2-3 周
 
