@@ -3,6 +3,9 @@
 *.o
 *.a
 
+# Build directories
+build/
+
 # Python
 __pycache__/
 *.py[cod]

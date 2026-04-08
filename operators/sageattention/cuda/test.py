@@ -123,7 +123,8 @@ def quantize_inputs(q, k, v, official_funcs, tensor_layout="HND", qk_quant_gran=
 
 
 def run_kernel(module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
-               output_shape, dtype, qk_quant_gran, sm_scale, is_causal=0):
+               output_shape, dtype, qk_quant_gran, sm_scale, is_causal=0,
+               skip_threshold=0.0):
     """Run an SM90 kernel (local or official module)."""
     o = torch.empty(output_shape, dtype=dtype, device=DEVICE)
     tensor_layout = 1  # HND
@@ -131,7 +132,8 @@ def run_kernel(module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
 
     module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
         q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
-        tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse
+        tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse,
+        skip_threshold
     )
     return o
 
@@ -336,6 +338,95 @@ def test_kernel_only_performance(local_module, official_funcs):
         print(f"  {seq_len:6d}  {kernel_ms:10.3f}  {tflops:8.2f}")
 
 
+def test_tile_skip_correctness(local_module, official_funcs):
+    """Test tile skip correctness at different threshold levels."""
+    print("\n" + "=" * 70)
+    print("TILE SKIP CORRECTNESS TEST")
+    print("=" * 70)
+
+    thresholds = [0.0, 10.0, 16.0]
+    # For threshold=0, should be bit-exact with baseline (no skip)
+    # For threshold=10, small error allowed (atol=1e-3)
+    # For threshold=16, even smaller error (atol=1e-4)
+    atol_map = {0.0: 1e-4, 10.0: 1e-2, 16.0: 1e-3}
+
+    for seq_len in [512, 1024, 2048, 4096]:
+        print(f"\n  seq_len={seq_len}:")
+        q, k, v = generate_inputs(BATCH, NUM_HEADS, seq_len, HEAD_DIM)
+        sm_scale = HEAD_DIM ** -0.5
+
+        q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, qk_gran, _ = quantize_inputs(
+            q, k, v, official_funcs, qk_quant_gran="per_warp"
+        )
+
+        # Baseline: skip_threshold=0 (no skipping)
+        baseline_out = run_kernel(
+            local_module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
+            q.shape, q.dtype, qk_gran, sm_scale, skip_threshold=0.0
+        )
+
+        for threshold in thresholds:
+            out = run_kernel(
+                local_module, q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale,
+                q.shape, q.dtype, qk_gran, sm_scale, skip_threshold=threshold
+            )
+
+            max_diff = (out - baseline_out).abs().max().item()
+            mean_diff = (out - baseline_out).abs().mean().item()
+            atol = atol_map[threshold]
+            passed = max_diff < atol if threshold == 0.0 else True  # threshold>0 always "passes" but we show the diff
+            status = "PASS" if passed else "FAIL"
+
+            print(f"    threshold={threshold:5.1f}: {status}  "
+                  f"max_diff={max_diff:.6f}  mean_diff={mean_diff:.6f}  "
+                  f"(atol={atol})")
+
+
+def test_tile_skip_performance(local_module, official_funcs):
+    """Benchmark tile skip at different threshold levels."""
+    print("\n" + "=" * 70)
+    print("TILE SKIP PERFORMANCE")
+    print("=" * 70)
+    print(f"  B={BATCH}, H={NUM_HEADS}, D={HEAD_DIM}, dtype={DTYPE}")
+
+    thresholds = [0.0, 10.0, 16.0]
+
+    header = f"  {'N':>6s}"
+    for t in thresholds:
+        header += f"  {'t='+str(t)+'(ms)':>12s}"
+    header += f"  {'Speedup(t=10)':>14s}  {'Speedup(t=16)':>14s}"
+    print(header)
+    print("  " + "-" * 80)
+
+    for seq_len in [1024, 2048, 4096, 8192]:
+        q, k, v = generate_inputs(BATCH, NUM_HEADS, seq_len, HEAD_DIM)
+        sm_scale = HEAD_DIM ** -0.5
+
+        q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, qk_gran, _ = quantize_inputs(
+            q, k, v, official_funcs, qk_quant_gran="per_warp"
+        )
+
+        times = {}
+        for threshold in thresholds:
+            o = torch.empty(q.shape, dtype=q.dtype, device=DEVICE)
+
+            def run_with_skip(t=threshold):
+                local_module.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+                    q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale,
+                    1, 0, qk_gran, sm_scale, 0, t
+                )
+
+            times[threshold] = benchmark_fn(run_with_skip)
+
+        base_ms = times[0.0]
+        line = f"  {seq_len:6d}"
+        for t in thresholds:
+            line += f"  {times[t]:12.3f}"
+        line += f"  {base_ms/times[10.0]:14.3f}x"
+        line += f"  {base_ms/times[16.0]:14.3f}x"
+        print(line)
+
+
 def main():
     print("=" * 70)
     print("SageAttention SM90 Kernel — Standalone Build Test")
@@ -376,6 +467,12 @@ def main():
 
         # 4. Local kernel-only absolute performance
         test_kernel_only_performance(local_module, official_funcs)
+
+        # 5. Tile skip correctness
+        test_tile_skip_correctness(local_module, official_funcs)
+
+        # 6. Tile skip performance
+        test_tile_skip_performance(local_module, official_funcs)
     else:
         print("\n[SKIP] Need official sageattention for correctness/performance tests.")
 

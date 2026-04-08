@@ -124,13 +124,13 @@ __device__ __forceinline__ void arrive(uint64_t* bar) {
 }
 
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeOut, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false>
-__global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap tensorMapQ, 
+__global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap tensorMapQ,
                                         const __grid_constant__ CUtensorMap tensorMapK,
                                         const __grid_constant__ CUtensorMap tensorMapV,
                                         float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
                                         DTypeOut* O, float *__restrict__ Lse, uint32_t stride_bz_o, uint32_t stride_h_o, uint32_t stride_seq_o,
                                         const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
-                                        float sm_scale)
+                                        float sm_scale, float skip_threshold)
 {
   static_assert(NUM_THREADS == 128);
   static_assert(CTA_Q <= CTA_K);
@@ -304,6 +304,51 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         }
       }
     }
+
+    // === Tile skip check ===
+    // After int32->float conversion, check if this KV tile's max logit
+    // is far below the running max. If so, skip softmax + PV WGMMA.
+    if (skip_threshold > 0.0f) {
+      bool my_can_skip = true;
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++) {
+          float m_local = -5000000.0f;
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+            m_local = max(m_local, max(
+              max(RS_f32[fq][fk][k*2+0], RS_f32[fq][fk][k*2+1]),
+              max(RS_f32[fq][fk][k*2+4], RS_f32[fq][fk][k*2+5])));
+          }
+          // Warp-level max reduction (4 lanes hold different columns of same row)
+          m_local = max(m_local, __shfl_xor_sync(0xffffffff, m_local, 0x1));
+          m_local = max(m_local, __shfl_xor_sync(0xffffffff, m_local, 0x2));
+
+          // sm_scale already includes dequant_scale for this iteration
+          float scaled_max = m_local * sm_scale;
+          if (scaled_max >= m[fq][k] - skip_threshold) {
+            my_can_skip = false;
+          }
+        }
+      }
+
+      // Block-level consensus: all 128 threads must agree to skip
+      int all_skip = __syncthreads_and(my_can_skip ? 1 : 0);
+
+      if (all_skip) {
+        // Must consume V barrier to keep phase tracking in sync
+        // (V[iter] was issued in previous iteration)
+        wait(&barrier_V, p);
+        // Issue V[next] TMA for next iteration
+        if (threadIdx.x == 0) {
+          expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
+          load_async_4D(sV, &tensorMapV, &barrier_V, iter * CTA_K, 0, kv_head_id, batch_id);
+        }
+        continue;
+      }
+    }
+    // === End tile skip check ===
 
     update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
 
@@ -577,7 +622,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
                   int is_causal,
                   int qk_quant_gran,
                   float sm_scale,
-                  int return_lse)
+                  int return_lse,
+                  float skip_threshold)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -727,7 +773,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
               (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
               stride_bz_o, stride_h_o, stride_seq_o,
-              qo_len, kv_len, num_kv_groups, sm_scale);
+              qo_len, kv_len, num_kv_groups, sm_scale, skip_threshold);
           });
         });
       });
@@ -749,7 +795,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    float skip_threshold)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -905,7 +952,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
               (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
               stride_bz_o, stride_h_o, stride_seq_o,
-              qo_len, kv_len, num_kv_groups, sm_scale);
+              qo_len, kv_len, num_kv_groups, sm_scale, skip_threshold);
           });
         });
       });

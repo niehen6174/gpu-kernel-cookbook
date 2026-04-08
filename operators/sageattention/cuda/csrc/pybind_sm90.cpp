@@ -18,8 +18,18 @@
 #include <torch/extension.h>
 #include "attn_cuda_sm90.h"
 
+namespace py = pybind11;
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-  m.def("qk_int8_sv_f8_accum_f32_attn_inst_buf", &qk_int8_sv_f8_accum_f32_attn_inst_buf);
-  m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf);
+  m.def("qk_int8_sv_f8_accum_f32_attn_inst_buf", &qk_int8_sv_f8_accum_f32_attn_inst_buf,
+        py::arg("query"), py::arg("key"), py::arg("value"), py::arg("output"),
+        py::arg("query_scale"), py::arg("key_scale"),
+        py::arg("tensor_layout"), py::arg("is_causal"), py::arg("qk_quant_gran"),
+        py::arg("sm_scale"), py::arg("return_lse"), py::arg("skip_threshold") = 0.0f);
+  m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf,
+        py::arg("query"), py::arg("key"), py::arg("value"), py::arg("output"),
+        py::arg("query_scale"), py::arg("key_scale"), py::arg("value_scale"),
+        py::arg("tensor_layout"), py::arg("is_causal"), py::arg("qk_quant_gran"),
+        py::arg("sm_scale"), py::arg("return_lse"), py::arg("skip_threshold") = 0.0f);
 }

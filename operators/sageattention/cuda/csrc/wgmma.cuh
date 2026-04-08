@@ -297,4 +297,18 @@ __device__ __forceinline__ void wgmma_f8f8f32(float d[][8], uint32_t* RA, T* sB)
     }
 }
 
+// Dynamic register reallocation (SM90+ only)
+// N must be a multiple of 8
+template <int N>
+__device__ __forceinline__ void setmaxnreg_inc_sync() {
+    static_assert(N % 8 == 0 && N > 0);
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N));
+}
+
+template <int N>
+__device__ __forceinline__ void setmaxnreg_dec_sync() {
+    static_assert(N % 8 == 0 && N > 0);
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N));
+}
+
 } // namespace wgmma
