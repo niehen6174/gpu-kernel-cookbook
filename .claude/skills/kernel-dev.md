@@ -210,7 +210,7 @@ else:
 ### 4.2 常见优化方向 (按收益排序)
 
 **Memory-bound 算子:**
-1. Vectorized load (float4) — 4x bandwidth
+1. Vectorized load (float4 / bf16x2 / half2) — 2-4x bandwidth
 2. Shared memory tiling + padding — 消除 bank conflict
 3. TMA (SM90) — 硬件异步加载
 4. Coalesced access pattern — 合并全局内存访问
@@ -227,6 +227,93 @@ else:
 2. 编译期常量 (template) 消除分支
 3. Loop unrolling (#pragma unroll)
 4. 融合相邻 kernel
+
+### 4.4 关键优化模式 (代码级)
+
+#### 向量化内存访问 (Vectorized Load/Store)
+
+BF16/FP16 使用 `x2` 类型一次读写 2 个元素，FP32 使用 `float4` 一次读写 4 个。
+实测 RMSNorm 上 BF16 向量化带来 **~3x** 加速。
+
+```cuda
+// BF16: 2 元素/次 (32-bit transaction)
+const __nv_bfloat162* vec_in = reinterpret_cast<const __nv_bfloat162*>(row_input);
+#pragma unroll 4
+for (int i = tid; i < hidden_size / 2; i += stride) {
+    __nv_bfloat162 v = vec_in[i];
+    float v0 = __bfloat162float(v.x);
+    float v1 = __bfloat162float(v.y);
+    // ... process v0, v1 in FP32 ...
+}
+
+// FP16: 同理
+const __half2* vec_in = reinterpret_cast<const __half2*>(row_input);
+__half2 v = vec_in[i];  // 2 元素/次
+
+// FP32: 4 元素/次 (128-bit transaction, 一个 warp 的一条事务)
+const float4* vec_in = reinterpret_cast<const float4*>(row_input);
+float4 v = vec_in[i];  // v.x, v.y, v.z, v.w
+```
+
+**注意**: 数组长度必须是向量宽度的倍数 (或处理尾部元素)，指针必须对齐。
+
+#### Bank Conflict 消除
+
+Shared memory 有 32 个 bank (每 bank 4 bytes)。Stride-32 访问 = 32 路冲突:
+
+```cuda
+// ❌ 32-stride: 全部命中同一 bank
+__shared__ float data[1024];
+float val = data[threadIdx.x * 32];
+
+// ✅ 连续访问: 无 bank conflict
+float val = data[threadIdx.x];
+
+// ✅ +1 padding: 消除列访问的 bank conflict (Tiled Matmul 关键技巧)
+__shared__ float Bs[TILE][TILE + 1];  // 33 instead of 32
+float val = Bs[k][threadIdx.x];       // 不同 bank
+```
+
+#### Warp Shuffle 规约 (替代 Shared Memory)
+
+Warp 内通信最快方式 — 无内存访问、无 bank conflict:
+
+```cuda
+// Sum reduction
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    return val;
+}
+
+// Max reduction
+template <typename T>
+__device__ __forceinline__ T warp_reduce_max(T val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = max(val, __shfl_xor_sync(0xffffffff, val, offset));
+    return val;
+}
+
+// Broadcast (lane 0 → all)
+float broadcast = __shfl_sync(0xffffffff, val, 0);
+```
+
+#### 混合精度累加模式
+
+输入用低精度 (BF16/FP16) 减少带宽，累加用 FP32 保证精度:
+
+```cuda
+float sum = 0.0f;  // FP32 累加
+for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = to_float(input[i]);  // BF16→FP32
+    sum += val * val;
+}
+sum = block_reduce_sum(sum);  // FP32 规约
+output[i] = from_float(result, (scalar_t*)nullptr);  // FP32→BF16
+```
 
 ### 4.3 SageAttention 优化历程 (参考案例)
 
@@ -471,4 +558,300 @@ bash scripts/profile.sh --op <name> --kernel <kernel> --set full
 # 查看 GPU 信息
 nvidia-smi
 python -c "import torch; print(torch.cuda.get_device_properties(0))"
+```
+
+---
+
+## 10. Kernel 代码模板
+
+> 精简可复用的模板。新 kernel 从对应模板出发，替换 `// Your computation here` 即可。
+> 所有模板支持 FP32 / FP16 / BF16 三种精度。
+
+### 10.1 类型转换 Helpers (每个 .cu 文件都要包含)
+
+```cuda
+__device__ __forceinline__ float to_float(float x) { return x; }
+__device__ __forceinline__ float to_float(__half x) { return __half2float(x); }
+__device__ __forceinline__ float to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+
+__device__ __forceinline__ float from_float(float x, float*) { return x; }
+__device__ __forceinline__ __half from_float(float x, __half*) { return __float2half(x); }
+__device__ __forceinline__ __nv_bfloat16 from_float(float x, __nv_bfloat16*) { return __float2bfloat16(x); }
+```
+
+> **注意**: PyTorch 禁用了隐式 FP16/BF16 转换，必须用显式 `to_float()` / `from_float()`。
+
+### 10.2 逐元素模板 (Element-wise)
+
+适用: vector_add, relu, gelu, rope, 等。
+
+```cuda
+constexpr int BLOCK_SIZE = 256;
+
+template <typename scalar_t>
+__global__ void elementwise_kernel(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const int total_elements
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        float val = to_float(input[idx]);
+        float result = val;  // Your computation here
+        output[idx] = from_float(result, (scalar_t*)nullptr);
+    }
+}
+
+// Launch: grid = (total_elements + 255) / 256, block = 256
+```
+
+### 10.3 行规约模板 (Row-wise Reduction)
+
+适用: rmsnorm, layernorm, softmax, 等。每 block 处理一行。
+
+```cuda
+constexpr int WARP_SIZE = 32;
+
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T block_reduce_sum(T val) {
+    __shared__ T shared[32];
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    val = warp_reduce_sum(val);
+    if (lane == 0) shared[wid] = val;
+    __syncthreads();
+    val = (threadIdx.x < blockDim.x / WARP_SIZE) ? shared[lane] : T(0);
+    if (wid == 0) val = warp_reduce_sum(val);
+    return val;
+}
+
+template <typename scalar_t>
+__global__ void reduction_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ output,
+    const int hidden_size, const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const scalar_t* row_in = input + row * hidden_size;
+
+    // Pass 1: 规约 (以 RMSNorm 为例: sum of squares)
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float v = to_float(row_in[i]);
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+
+    __shared__ float s_factor;
+    if (tid == 0) s_factor = rsqrtf(sum_sq / hidden_size + eps);
+    __syncthreads();
+
+    // Pass 2: 逐元素应用
+    scalar_t* row_out = output + row * hidden_size;
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float norm = to_float(row_in[i]) * s_factor;
+        row_out[i] = from_float(norm * to_float(weight[i]), (scalar_t*)nullptr);
+    }
+}
+
+// Launch: grid = num_rows, block = min(hidden_size, 1024) 对齐到 WARP_SIZE
+```
+
+**向量化版本** (BF16, ~3x 加速): 将 `scalar_t*` 重新解释为 `__nv_bfloat162*`，循环步长 /2，
+每次处理 2 元素。参考 §4.4 向量化模式。
+
+### 10.4 Tiled Matmul 模板
+
+适用: GEMM, batched matmul。C = A×B, A[M,K], B[K,N]。
+`+1` padding 消除 B 矩阵列访问的 bank conflict。
+
+```cuda
+constexpr int TILE = 32;
+
+__global__ void matmul_tiled(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE + 1];  // +1 padding 防 bank conflict
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        int a_col = t * TILE + threadIdx.x;
+        int b_row = t * TILE + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE; ++k)
+            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = acc;
+}
+
+// Launch: grid = ((N+31)/32, (M+31)/32), block = (32, 32)
+```
+
+### 10.5 全局归约模板 (Two-Pass Reduction)
+
+适用: 大数组求和/最大值。Phase 1 分块归约 → Phase 2 最终归约。
+
+```cuda
+__device__ float warp_reduce(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+__global__ void reduce_sum(const float* input, float* output, int n) {
+    __shared__ float warp_results[32];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x * 2 + tid;
+
+    // 每线程加载 2 个元素 (消除首步空闲线程)
+    float sum = 0.0f;
+    if (idx < n)               sum += input[idx];
+    if (idx + blockDim.x < n)  sum += input[idx + blockDim.x];
+
+    sum = warp_reduce(sum);
+    if (tid % 32 == 0) warp_results[tid / 32] = sum;
+    __syncthreads();
+
+    sum = (tid < blockDim.x / 32) ? warp_results[tid] : 0.0f;
+    if (tid / 32 == 0) sum = warp_reduce(sum);
+    if (tid == 0) output[blockIdx.x] = sum;
+}
+
+// Host: pass 1 (N → grid_size), pass 2 (grid_size → 1)
+```
+
+### 10.6 Stream Overlap Pipeline 模板
+
+适用: 大数据量 + 简单 kernel。4 路 stream 流水线重叠 H2D/Compute/D2H。
+
+```cuda
+void stream_pipeline(const float* h_in, float* h_out, int total) {
+    constexpr int NSTREAMS = 4;
+    int chunk = (total + NSTREAMS - 1) / NSTREAMS;
+
+    cudaStream_t streams[NSTREAMS];
+    for (int i = 0; i < NSTREAMS; ++i) cudaStreamCreate(&streams[i]);
+
+    float *d_in, *d_out;
+    cudaMalloc(&d_in,  total * sizeof(float));
+    cudaMalloc(&d_out, total * sizeof(float));
+
+    for (int i = 0; i < NSTREAMS; ++i) {
+        int off = i * chunk, cnt = min(chunk, total - off);
+        size_t bytes = cnt * sizeof(float);
+        cudaMemcpyAsync(d_in + off, h_in + off, bytes, cudaMemcpyH2D, streams[i]);
+        my_kernel<<<(cnt+255)/256, 256, 0, streams[i]>>>(d_in+off, d_out+off, cnt);
+        cudaMemcpyAsync(h_out + off, d_out + off, bytes, cudaMemcpyD2H, streams[i]);
+    }
+    cudaDeviceSynchronize();
+
+    for (int i = 0; i < NSTREAMS; ++i) cudaStreamDestroy(streams[i]);
+    cudaFree(d_in); cudaFree(d_out);
+}
+// 前提: h_in/h_out 必须是 pinned memory (cudaMallocHost)
+// 验证: nsys profile 查看 timeline，确认 copy 与 compute 并行
+```
+
+---
+
+## 11. SM90 (Hopper) 优化速查
+
+> 参数以 **H20** (60 SMs, ~4.0 TB/s HBM) 为准。H100 差异: 132 SMs, 3.35 TB/s。
+
+### 11.1 硬件参数对照
+
+| 参数 | H20 | H100 | 优化影响 |
+|------|-----|------|---------|
+| SMs | 60 | 132 | Grid 大小对齐 SM 数的倍数 |
+| Threads/SM | 2048 | 2048 | 最多 16 blocks × 128 threads |
+| Shared Memory | 228 KB/SM | 192 KB/SM | H20 可用更大 tile |
+| L2 Cache | 60 MB | 50 MB | H20 更大，跨 block 复用更多 |
+| HBM BW | ~4.0 TB/s | 3.35 TB/s | Coalesced 访问至关重要 |
+| Warp Size | 32 | 32 | 所有 reduction 用 shuffle |
+| Registers/SM | 65536 | 65536 | >255/thread 则 spill |
+
+### 11.2 Shared Memory 配置
+
+H20 每 SM 支持可配置 smem/L1 拆分:
+
+```cuda
+// 请求最大 dynamic shared memory
+cudaFuncSetAttribute(my_kernel,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    228 * 1024);  // H20: 228KB max
+```
+
+### 11.3 Occupancy 快速计算
+
+```
+Occupancy = Active Warps / Max Warps(64)
+
+限制因素 (取最小):
+  1. 寄存器: 65536 / (threads_per_block × regs_per_thread)
+  2. Shared memory: 228KB / smem_per_block
+  3. 线程数: 2048 / threads_per_block
+```
+
+查看实际寄存器用量:
+```bash
+nvcc --ptxas-options=-v -arch=sm_90 my_kernel.cu
+# 输出: "Used X registers, Y bytes smem"
+```
+
+### 11.4 Block Size 选择指南
+
+| Kernel 类型 | Threads/Block | Warps | 理由 |
+|-------------|---------------|-------|------|
+| 逐元素 | 256 | 8 | 高 occupancy, 简单 |
+| 行规约 | 512-1024 | 16-32 | 需要足够线程完成规约 |
+| Attention | 256 | 8 | 平衡 smem 和寄存器 |
+| GEMM (Tiled) | 256 (16×16) or 1024 (32×32) | 8/32 | 取决于 tile 大小 |
+
+### 11.5 NCU / Nsys Profiling 命令
+
+```bash
+# Nsys: 系统级 timeline (kernel 耗时、内存传输、GPU 空闲)
+nsys profile -o report python test.py
+
+# NCU: kernel 级分析 (occupancy, throughput, stall 原因)
+ncu --set full -o metrics.ncu-rep python test.py
+
+# NCU 特定指标
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed python test.py
+```
+
+### 11.6 NVCC 编译 Flags
+
+```bash
+nvcc -arch=sm_90 -O3 kernel.cu           # 基本
+nvcc --ptxas-options=-v kernel.cu         # 查看寄存器/smem 用量
+nvcc -maxrregcount=128 kernel.cu          # 限制寄存器上限
+nvcc --use_fast_math kernel.cu            # 快速但低精度数学函数
+nvcc -lineinfo kernel.cu                  # 添加调试行号信息
 ```
