@@ -855,3 +855,146 @@ nvcc -maxrregcount=128 kernel.cu          # 限制寄存器上限
 nvcc --use_fast_math kernel.cu            # 快速但低精度数学函数
 nvcc -lineinfo kernel.cu                  # 添加调试行号信息
 ```
+
+---
+
+## 12. SM89 (Ada Lovelace) 优化速查
+
+当需要在 L40S / RTX 4090 / RTX 4070 等 Ada 架构上运行时参考本节。
+
+### 12.1 SM89 vs SM90 关键差异
+
+| 特性 | SM89 (Ada) | SM90 (H20/Hopper) |
+|------|-----------|-------------------|
+| Shared Memory/SM | **100 KB** | 228 KB (H20) / 192 KB (H100) |
+| L1+Shared 合计 | 128 KB | 256 KB |
+| Threads/SM | 1536 | 2048 |
+| Warps/SM | 48 | 64 |
+| Max Blocks/SM | **24** | 16 |
+| Registers/SM | 65536 | 65536 |
+| TMA | ❌ 无 | ✅ |
+| Thread Block Clusters | ❌ 无 | ✅ |
+| Distributed Shared Memory | ❌ 无 | ✅ |
+| 显存类型 | GDDR6/GDDR6X | HBM3/HBM3e |
+| Async Copy | **cp.async** | TMA |
+
+### 12.2 典型设备参数
+
+| 设备 | SMs | 显存带宽 | L2 Cache | 显存 |
+|------|-----|---------|----------|------|
+| L40S | 142 | 864 GB/s | **96 MB** | 48 GB GDDR6 |
+| RTX 4090 | 128 | 1.01 TB/s | 72 MB | 24 GB GDDR6X |
+| RTX 4070 | 46 | 504 GB/s | 36 MB | 12 GB GDDR6X |
+| RTX 6000 Ada | 142 | 960 GB/s | **96 MB** | 48 GB GDDR6 |
+
+### 12.3 Tile Sizing — 100 KB 限制
+
+SM89 最大 smem = 100 KB，直接影响 tile 大小选择:
+
+```cuda
+// SM90 可用: 128×64 FP16 tile = 16 KB, 双缓冲 = 32 KB, 192 KB 绰绰有余
+// SM89 必须缩小: 100 KB 总预算
+
+// Attention on SM89:
+// Q: 64×64 × 2B = 8 KB
+// K: 64×64 × 2B = 8 KB
+// V: 64×64 × 2B = 8 KB  → 共 24 KB, 双缓冲 48 KB < 100 KB ✓
+
+// GEMM on SM89 (双缓冲):
+// A: 64×32 × 2B = 4 KB × 2 = 8 KB
+// B: 32×64 × 2B = 4 KB × 2 = 8 KB → 共 16 KB < 100 KB ✓
+
+cudaFuncSetAttribute(kernel,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    100 * 1024);  // SM89 max: 100 KB
+```
+
+### 12.4 cp.async 双缓冲 (替代 TMA)
+
+SM89 无 TMA，使用 cp.async 实现异步 global→shared 拷贝:
+
+```cuda
+#include <cuda_pipeline.h>
+
+__shared__ float buf[2][TILE_K][TILE_N];
+int stage = 0;
+
+// 预取第一个 tile
+__pipeline_memcpy_async(&buf[0][ty][tx], &A[...], sizeof(float));
+__pipeline_commit();
+
+for (int k = 0; k < K; k += TILE_K) {
+    // 预取下一个 tile 到另一个 buffer
+    if (k + TILE_K < K) {
+        __pipeline_memcpy_async(&buf[1-stage][ty][tx], &A[...], sizeof(float));
+        __pipeline_commit();
+    }
+    __pipeline_wait_prior(1);  // 等待当前 tile 就绪
+    __syncthreads();
+
+    compute(buf[stage]);       // 计算当前 tile
+    stage = 1 - stage;
+}
+```
+
+### 12.5 L2 Cache 利用策略
+
+Ada 的 L2 (72-96 MB) 远大于 Hopper (50 MB)，是弥补 smem 不足的关键:
+
+```cuda
+// 核心策略: 小 smem tile + 依赖 L2 做 inter-tile 重用
+// 而非 Hopper 的 大 smem tile + 中等 L2
+
+// L2 persistence hints (Ada 支持)
+asm volatile("ld.global.ca.b32 %0, [%1];" : "=r"(val) : "l"(ptr));  // 保留在 L2
+asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(ptr));  // 流式,不污染 L2
+```
+
+### 12.6 Occupancy 与 Block Size
+
+```
+SM89 Occupancy = Active Warps / 48
+
+ 64 threads (2 warps) × 24 blocks = 48 warps → 100% ✓
+128 threads (4 warps) × 12 blocks = 48 warps → 100% ✓
+256 threads (8 warps) ×  6 blocks = 48 warps → 100% ✓  ← 推荐
+512 threads (16 warps) × 3 blocks = 48 warps → 100% ✓
+1024 threads (32 warps) × 1 block = 32 warps → 67%  ⚠️ 避免!
+```
+
+**规则**: 优先 256 threads/block; **禁止** 1024 threads/block (occupancy 上限 67%)。
+
+### 12.7 SM89 优化优先级
+
+1. **Fusion 最重要** — GDDR 带宽低 (864 GB/s vs H20 ~4.0 TB/s), 每次 kernel launch 的内存代价更高
+2. **向量化访问** — GDDR 对 coalescing 更敏感,必须用 `__nv_bfloat162`/`float4`
+3. **L2 重用** — 小 tile 高频迭代,数据留在 L2
+4. **cp.async 双缓冲** — 异步搬运 + 计算重叠
+5. **FP32 双发射** — Ada 有 128 FP32 cores/SM (dual datapath)，FP32 计算几乎免费
+
+### 12.8 SM89 编译 Flags
+
+```bash
+nvcc -arch=sm_89 -O3 kernel.cu             # Ada 专用
+
+# 多架构构建 (Ada + Hopper)
+nvcc -gencode arch=compute_89,code=sm_89 \
+     -gencode arch=compute_90,code=sm_90 \
+     -O3 kernel.cu
+
+# Grid sizing: 动态获取 SM 数
+cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+// L40S=142, RTX 4090=128, RTX 4070=46
+```
+
+### 12.9 SM89 Profiling 要点
+
+```bash
+ncu --set full -o metrics.ncu-rep python test.py
+```
+
+重点关注指标 (与 SM90 不同):
+- **L2 hit rate** — Ada 优化的核心指标,低于 80% 说明 tile 策略需调整
+- **Memory throughput** — 占 GDDR peak 百分比 (通常 30-40%)
+- **Achieved occupancy** — 上限 48 warps, 检查是否被 1024-thread block 限制
+- **FP32 dual-issue utilization** — Ada 特有,衡量双发射利用率
